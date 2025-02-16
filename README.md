@@ -14,17 +14,18 @@ We aim to:
 See [Roadmap.md](./docs/Roadmap.md) for more details
 
 > [!Important]
-> This is Alpha Release 0.1.1 for the library. It is designed to process Model Weights directly from Hugging Face models and convert them to the CoreML format for Apple Neural Engine (ANE for short).
+> This is Alpha Release 0.1.2 for the library. It is designed to process Model Weights directly from Hugging Face models and convert them to the CoreML format for Apple Neural Engine (ANE for short).
 > - This release only supports LLAMA models including DeepSeek distilled models on LLaMA 3.1 architecture
 > - The future release will add support for more models and architectures
+> - Please visit https://huggingface.co/anemll where we uload the latest models and X: [@anemll](https://x.com/anemll) for updates
+> - Please star this repo to support the project!
 
+### New in 0.1.2 🚀
+- Dependency checks and troubleshooting guide [docs/troubleshooting.md](./docs/troubleshooting.md) added
+- Prefill batch size added to the conversion script
+- Chat_full interface updated for DeepHermes "think" token "/t" and both chat interfaces added --nw flag to skip warmup step ( [docs/chat.md](./docs/chat.md) )
+- XCode Tools dependency added to the README
 
-### New in 0.1.1 🚀
-- Single-shot model conversion with [Convert Model Script](./docs/convert_model.md)
-- Simplified model configuration with [meta.yaml](./docs/chat.md)
-- Automated Hugging Face distribution preparation with [prepare_hf.sh](./docs/prepare_hf.md)
-- Enhanced Chat Interfaces with better error handling and configuration support - see [chat.md](./docs/chat.md)
-- Improved LLaMA model with prefill optimization 
 
 ## Basic Workflow
 
@@ -117,7 +118,16 @@ pip install -r requirements.txt
 # pip install anemll
 # due to Alpha Release, we do not recommend installing ANEMLL as a package yet
 ```
-
+CoreML compiler is required to compile the model. It is part of the Xcode command line tools.
+- Ensure that Xcode Command Line Tools are installed, as they include `coremlcompiler`.
+- You can install them by running `xcode-select --install`.
+- Verify that the `xcrun` command is available and correctly configured in your PATH.
+- Use `xcrun --find coremlcompiler` to verify the installation.
+- If above fails, please try following steps:
+- Download Xcode from the App Store.
+- Run `sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer/` to set the path.
+- Use `xcrun --find coremlcompiler` to verify the installation.
+- Run `sudo xcodebuild -license` and agree to the license.
 
 
 ## Model Support
@@ -130,7 +140,7 @@ Currently optimized for:
 
 ### Core Technologies
 - Thanks to [@apple](https://apple.com) for developing the Apple Neural Engine 
-- Thanks to Appel CoreML Tools team for providing the tools https://github.com/apple/coremltools
+- Thanks to Apple CoreML Tools team for providing the tools https://github.com/apple/coremltools
 - Thanks to [@huggingface](https://huggingface.co) for providing the transformers library and models
 
 ### Inspirations, feedback and other resources
@@ -154,9 +164,13 @@ https://opensource.org/license/mit
 
 - 🌐 Website: [anemll.com](https://anemll.com)
 - 🤗 Models: [huggingface.co/anemll](https://huggingface.co/anemll)
-- 📱 Twitter: [@anemll](https://x.com/anemll)
+- 📱 X: [@anemll](https://x.com/anemll)
 - 💻 GitHub: [github.com/anemll](https://github.com/anemll)
 
 ## Contact
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Anemll/Anemll&type=Date)](https://star-history.com/#Anemll/Anemll&Date)
 
 For any questions or support, reach out to us at [realanemll@gmail.com](mailto:realanemll@gmail.com)

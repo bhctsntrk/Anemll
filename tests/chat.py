@@ -243,18 +243,28 @@ def load_metadata(model,args):
         else:
             ctx_len = args.context_length
 
-        # Use defaults
+        # Use defaults or values from args
         metadata['context_length'] = ctx_len
         metadata['state_length'] = ctx_len
-        metadata['batch_size'] = 64
+        # Get batch size from args or use default
+        metadata['batch_size'] = getattr(args, 'batch_size', 64)
         metadata['lut_bits'] = 4
-        metadata['num_chunks'] = 4
-        print("\nUsing default parameters:")
+        metadata['num_chunks'] = getattr(args, 'num_chunks', 4)
+        print("\nUsing parameters:")
         print(f"  Context Length: {metadata['context_length']}")
         print(f"  State Length: {metadata['state_length']}")
         print(f"  Prefill Batch Size: {metadata['batch_size']}")
         print(f"  LUT Bits: {metadata['lut_bits']}")
         print(f"  Number of Chunks: {metadata['num_chunks']}")
+
+    # Override with values from args if they exist
+    if hasattr(args, 'batch_size') and args.batch_size is not None:
+        metadata['batch_size'] = args.batch_size
+        print(f"\nOverriding batch size from args: {args.batch_size}")
+    if hasattr(args, 'num_chunks') and args.num_chunks is not None:
+        metadata['num_chunks'] = args.num_chunks
+        print(f"\nOverriding num chunks from args: {args.num_chunks}")
+    
     return metadata
     
 def load_models(args,metadata):
@@ -678,9 +688,15 @@ def parse_args():
     parser.add_argument('--prompt', type=str,
                        help='If specified, run once with this prompt and exit')
     
+    # Add no-warmup flag
+    parser.add_argument('--nw', action='store_true',
+                       help='Skip warmup phase')
+    
     # Model configuration
     parser.add_argument('--context-length', type=int,
                        help='Context length for the model (default: 512), if not provided, it will be detected from the model directory name ctxNUMBER')
+    parser.add_argument('--batch-size', type=int,
+                       help='Batch size for prefill (default: 64)')
     
     args = parser.parse_args()
     
@@ -711,9 +727,11 @@ def parse_args():
             if not args.tokenizer:
                 args.tokenizer = args.d
             
-            # Set other parameters
-            args.context_length = int(params['context_length'])
-            args.batch_size = int(params['batch_size'])
+            # Set other parameters if not overridden by command line
+            if args.context_length is None:
+                args.context_length = int(params['context_length'])
+            if args.batch_size is None:
+                args.batch_size = int(params['batch_size'])
             args.num_chunks = num_chunks
             
             print(f"\nLoaded parameters from {args.meta}:")
@@ -783,17 +801,18 @@ def main():
         state = create_unified_state(ffn_models, metadata['context_length'])
         
         # Warmup runs to prevent Python GIL issues with CoreML !
-        for i in range(2):
-            chat_loop(
-                embed_model=embed_model,
-                ffn_models=ffn_models,
-                lmhead_model=lmhead_model,
-                tokenizer=tokenizer,
-                metadata=metadata,
-                state=state,
-                warmup=True,
-                auto_prompt="who are you?"
-            )
+        if not args.nw:
+            for i in range(2):
+                chat_loop(
+                    embed_model=embed_model,
+                    ffn_models=ffn_models,
+                    lmhead_model=lmhead_model,
+                    tokenizer=tokenizer,
+                    metadata=metadata,
+                    state=state,
+                    warmup=True,
+                    auto_prompt="who are you?"
+                )
         
         # Main run
         chat_loop(
