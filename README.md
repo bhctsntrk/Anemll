@@ -13,7 +13,7 @@ ANEMLL (pronounced like "animal") is an open-source project focused on accelerat
 
 See update [Roadmap.md](./docs/Roadmap.md) for more details
 
-## Main Components in 0.3.0 Release
+## Main Components in 0.3.0 Alpha Release
 
 ANEMLL provides five main components for Apple Neural Engine inference development:
 
@@ -28,22 +28,26 @@ ANEMLL provides five main components for Apple Neural Engine inference developme
    - Basic chat interface (`chat.py`)
    - Advanced conversation management (`chat_full.py`)
 
-4. [iOS/macOS Sample Applications](./docs/sample_apps.md) - Ready-to-use example applications
+4. [iOS/macOS Sample Applications](./docs/sample_apps.md) - Ready-to-use example applications (Alpha, now on TestFlight)
    - SwiftUI Chat interface
+   - Model Downloads and integration example
    - Conversation management
-   - Model integration examples
 
 5. [ANEMLL-BENCH](https://github.com/anemll/anemll-bench) - Apple Neural Engine Benchmarking
    - Performance testing and comparison
    - Model optimization metrics
    - Hardware-specific benchmarks
+   - [GitHub Repository](https://github.com/anemll/anemll-bench)
 
 ### Pre-converted Models
 
 We provide sample converted models ready for use:
 - LLAMA 3.1 (1B and 8B variants) including iOS "friendly builds"
-- DeepSeek Coder distilled models
+- DeepSeek  distilled models
 - DeepHermes distilled models
+> [!NOTE]
+> Please note that Quantization should be improved. LUT4 quality is fairly low due to lack of Block Quantization on Apple Neural Engine.
+> Some GPTQ and Spin Quant should greatly improve LUT4 models.
 
 Visit our [Hugging Face repository](https://huggingface.co/anemll) for the latest converted models.
 
@@ -58,22 +62,10 @@ Visit our [Hugging Face repository](https://huggingface.co/anemll) for the lates
 ### New in 0.3.0 🚀
 
 Swift UI Sample Code
-- Sample iOS/macOS inference Chat-Bot App
-- Updates to Model conversion scripts 
+- Sample iOS/macOS inference Chat-Bot App (Alpha)
+- Updates to Model conversion and upload scripts 
+- Updates to Swift Package and CLI App
 
-> Reference implementation for Swift inference:
-> ```bash
-> cd anemll-swift-cli
-> ```
-> # To Build
-> ```bash
-> swift build -c release
-> ```
-> # To Run:
-> ```bash
-> swift run -c release anemllcli --meta <path_to_anemall_model_folder>/meta.yaml
-> # optional parms: --prompt "Who are you?"
-> ```
 
 ### Sample iOS/macOS Applications
 - Downloads reference or custom models from HuggingFace
@@ -84,51 +76,28 @@ Swift UI Sample Code
 > [!Tip]
 > Try our TestFlight app: [Join Beta](https://testflight.apple.com/join/jrQq1D1C)
 
-## Basic Workflow
+## Swift CLI Reference Implementation
 
-See [Model Conversion Guide](./docs/convert.md) and [DeepSeek Model Conversion Guide](./docs/ConvertingDeepSeek.md) and Single-shot model conversion with [Convert Model Script](./docs/convert_model.md) for more details.
+The Swift CLI provides a reference implementation for running models on Apple Neural Engine. For detailed documentation, see [Swift CLI Guide](./docs/swift_cli.md).
 
-1. Download the model from Hugging Face
-2. Convert the model to the CoreML format using ANEMLL
-3. Run the model on the Apple Neural Engine using provided example code `chat.py`
+### Quick Start
 
-### Conversion Process Overview
-- ANE models on iOS are limited to 1GB file size. macOS will work with ~2GB
-- We split models during the conversion process to avoid this limit
+1. Download a model from [Hugging Face](https://huggingface.co/anemll)
+2. Convert the model using our single-shot conversion script:
+```bash
+./anemll/utils/convert_model.sh --model <path_to_model> --output <output_directory>
+```
+3. Run the model using our sample code:
+```bash
+python ./tests/chat.py --meta <output_directory>/meta.yaml
+```
 
-### Model Components
-There are 3 parts for LLM:
-1. Embeddings
-2. Feed Forward Network/layers 
-3. LM Head
+For detailed conversion steps and advanced options, see:
+- [Model Conversion Guide](./docs/convert.md)
+- [Single-shot Conversion Script](./docs/convert_model.md)
+- [DeepSeek Model Guide](./docs/ConvertingDeepSeek.md)
 
-> LLaMA Model ANE optimized implementation is in `./anemll/models/llama_model.py`
-
-For FFN, we can split it into multiple chunks to allow for big models (like 8GB LLaMA/DeepSeek)
-
-### Conversion Steps explained
-
-1. **ANE_converter**:
-   - `./anemll/ane_converter/llama_converter.py` creates MLPackages for each part
-   - We also create "Prefill" models for KV cache
-   - This implementation uses Stateful API for ANE, introduced in iOS 18 / macOS 15
-
-2. **Combine Models**:
-   - After creating MLPackages, we merge FFN and prefill chunks into Multi-Function Chunks
-   - This reduces weight size by 50% as KV pre-fill and FFN use the same weights
-   - Processed by `./anemll/utils/combine_models.py`
-
-3. **Compile Models**:
-   - Convert to MLModelC format for on-device inference
-   - Done via `./anemll/utils/compile_models.py`
-
-Additional Documentation:
-- See Single-shot model conversion with [convert_model.sh](./docs/convert_model.md)
-- See Automated Hugging Face Model Distribution preparation with [prepare_hf.sh](./docs/prepare_hf.md)
-- See [Model Conversion Documentation](./docs/convert.md) for more details
-
-
-## Testing
+## Testing with Python
 
 We provide two chat interfaces:
 - `chat.py` - Basic chat interface for quick testing
@@ -190,7 +159,7 @@ CoreML compiler is required to compile the model. It is part of the Xcode comman
 ## Model Support
 
 Currently optimized for:
-- Meta's LLaMA 3.2 1B and 8B (1024 context) model including DeepSeek R1 8GB distilled model
+- Meta's LLaMA 3.2 1B and 8B (1024 context) model including DeepSeek R1 8B distilled model, DeepHermes 3B and 8B models
 - More models are coming soon
 
 ## Acknowledgements

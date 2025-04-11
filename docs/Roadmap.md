@@ -4,14 +4,15 @@
 - [x] Initial Release - Basic conversion/test
 - [x] Automated single script workflow
 - [x] Documentation and guides
-- [x] Swift Sample Code
-- [x] iOS/SwiftUI Sample Application
+- [x] Swift Package and sample code
+- [x] Profiling (see [ANEMLL-BENCH](https://github.com/anemll/anemll-bench))
+- [x] iOS/SwiftUI Sample Application (Alpha, TestFlight)
 
 ## Upcoming Milestones 🚧
 
+- [ ] SpinQuant Implementation
 - [ ] Qwen Architecture Support
 - [ ] Conversion/Quantization Pipeline Re-factoring
-- [ ] SpinQuant Implementation
 - [ ] Int4 Linear Quantization
 - [ ] LoRA Support
 - [ ] Basic ANE Server Implementation w/Third-party API
