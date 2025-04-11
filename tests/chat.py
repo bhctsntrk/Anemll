@@ -66,6 +66,10 @@ class TokenPrinter:
         # Decode all tokens at once in the main thread
         token_str = self.tokenizer.decode(self.decoding_buffer)
         self.decoding_buffer.clear()
+        
+        # Store the text in buffer for later saving to file
+        with self.lock:
+            self.buffer += token_str
 
         # Color-handling logic
         if self.thinking and "</think>" in token_str:
@@ -98,6 +102,8 @@ class TokenPrinter:
     def stop(self):
         """Stop the printer thread."""
         if self.thread and self.thread.is_alive():
+            # Ensure any remaining tokens are processed
+            self.drain_buffer()
             self.stop_event.set()
             try:
                 self.thread.join(timeout=1.0)
@@ -386,11 +392,19 @@ def make_causal_mask(length, start):
     mask[:, :, col_indices <= (row_indices + start)] = 0
     return mask
 
-def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length, batch_size=64, state=None):
-    """Run prefill on the input sequence."""
-    # Create causal mask
+def initialize_causal_mask(context_length):
+    """Initialize causal mask for transformer attention."""
     causal_mask = make_causal_mask(context_length, 0)
     causal_mask = torch.tensor(causal_mask, dtype=torch.float16)
+    print(f"\nInitialized causal mask for context length {context_length}")
+    return causal_mask
+
+def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length, batch_size=64, state=None, causal_mask=None):
+    """Run prefill on the input sequence."""
+    # Use provided causal mask or create one if not provided
+    if causal_mask is None:
+        causal_mask = make_causal_mask(context_length, 0)
+        causal_mask = torch.tensor(causal_mask, dtype=torch.float16)
     
     # Process in batches
     batch_pos = 0
@@ -412,9 +426,12 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
         position_ids = torch.arange(batch_size, dtype=torch.int32)  # Changed: Always use full batch size
         batch_causal_mask = causal_mask[:, :, :batch_size, :]  # Changed: Use full batch size
         
-        # Run embeddings
+        # Run embeddings with proper batch size
         hidden_states = torch.from_numpy(
-            embed_model.predict({'input_ids': batch_input.numpy()})['hidden_states']
+            embed_model.predict({
+                'input_ids': batch_input.numpy(),
+                'batch_size': np.array([batch_size], dtype=np.int32)  # Add batch_size parameter
+            })['hidden_states']
         )
         
         # Run through FFN chunks with state
@@ -433,7 +450,7 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
     
     return torch.tensor([context_pos], dtype=torch.int32)
 
-def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, context_length, state=None, temperature=0.0):
+def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, context_length, state=None, causal_mask=None, temperature=0.0):
     """Generate the next token."""
     # Get current token
     current_token = input_ids[:, pos-1:pos]  # [1, 1]
@@ -447,8 +464,13 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
     update_mask = torch.zeros((1, 1, context_length, 1), dtype=torch.float16)
     update_mask[0, 0, pos-1, 0] = 1.0
     position_ids = torch.tensor([pos-1], dtype=torch.int32)  # [1]
-    causal_mask = make_causal_mask(context_length, 0)
-    causal_mask = torch.tensor(causal_mask[:, :, pos-1:pos, :], dtype=torch.float16)  # [1, 1, 1, context_length]
+    
+    # Use provided causal mask or create one if not provided
+    if causal_mask is None:
+        causal_mask_data = make_causal_mask(context_length, 0)
+        single_causal_mask = torch.tensor(causal_mask_data[:, :, pos-1:pos, :], dtype=torch.float16)  # [1, 1, 1, context_length]
+    else:
+        single_causal_mask = causal_mask[:, :, pos-1:pos, :]
     
     # Run through FFN chunks with state
     for ffn_model in ffn_models:
@@ -457,7 +479,7 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
                 'hidden_states': hidden_states.numpy(),
                 'update_mask': update_mask.numpy(),
                 'position_ids': position_ids.numpy(),
-                'causal_mask': causal_mask.numpy(),
+                'causal_mask': single_causal_mask.numpy(),
                 'current_pos': position_ids.numpy()
             }
             output = ffn_model['infer'].predict(inputs, state)
@@ -503,7 +525,7 @@ def create_unified_state(ffn_models, context_length):
         print("\nCreated unified transformer state")
         return state
 
-def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, auto_prompt=None, warmup=False):
+def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None):
     """Interactive chat loop."""
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
@@ -577,7 +599,7 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                 # Start prefill timing
                 prefill_start = time.time()
                 
-                # Run prefill with state
+                # Run prefill with state and causal mask
                 current_pos = run_prefill(
                     embed_model,
                     ffn_models,
@@ -585,7 +607,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     context_pos,
                     context_length,
                     batch_size,
-                    state
+                    state,
+                    causal_mask
                 )
                 
                 # Calculate prefill timing
@@ -600,7 +623,7 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                 inference_tokens = 0
                 
                 while pos < context_length - 1:
-                    # Generate next token
+                    # Generate next token with causal mask
                     next_token = generate_next_token(
                         embed_model,
                         ffn_models,
@@ -608,7 +631,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                         input_ids,
                         pos,
                         context_length,
-                        state
+                        state,
+                        causal_mask
                     )
                     
                     # Add token to sequence
@@ -649,6 +673,26 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     print(f"Inference: {inference_tokens_per_sec:.1f} t/s")
                     print(f"Total: Generated {tokens_generated} tokens in {prefill_time + inference_time:.2f}s")
                     conversation.append({"role": "assistant", "content": response})
+                    
+                    # Save response to file if requested
+                    if save_file:
+                        try:
+                            # Add small delay to ensure all tokens are processed
+                            time.sleep(0.5)
+                            
+                            # Make sure response ends with EOS token if it's supposed to
+                            if response and not response.endswith("<|eot_id|>") and not response.endswith("</s>"):
+                                if tokenizer.eos_token:
+                                    eos_text = tokenizer.decode([tokenizer.eos_token_id])
+                                    if not response.endswith(eos_text):
+                                        print(f"\n{DARK_BLUE}Adding missing EOS token for consistency{RESET_COLOR}")
+                                        response += eos_text
+                            
+                            with open(save_file, 'w') as f:
+                                f.write(response)
+                            print(f"\n{DARK_BLUE}Response saved to file: {save_file}{RESET_COLOR}")
+                        except Exception as e:
+                            print(f"\n{DARK_BLUE}Error saving to file: {str(e)}{RESET_COLOR}")
                 else:
                     token_printer.stop()  # Clean up without printing stats
                 
@@ -667,7 +711,7 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
         traceback.print_exc()
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Chat with CoreML LLaMA (c) 2025 Anemll')
+    parser = argparse.ArgumentParser(description='Chat with CoreML LLaMA, gil resolved  (c) 2025 Anemll')
     
     # Add meta.yaml option
     parser.add_argument('--meta', type=str, help='Path to meta.yaml to load all parameters')
@@ -687,6 +731,10 @@ def parse_args():
     # Add new argument for auto-generation
     parser.add_argument('--prompt', type=str,
                        help='If specified, run once with this prompt and exit')
+    
+    # Add save option
+    parser.add_argument('--save', type=str,
+                       help='Save assistant\'s response to specified file')
     
     # Add no-warmup flag
     parser.add_argument('--nw', action='store_true',
@@ -715,13 +763,14 @@ def parse_args():
             prefix = params.get('model_prefix', 'llama')  # Default to 'llama' if not specified
             lut_ffn = f"_lut{params['lut_ffn']}" if params['lut_ffn'] != 'none' else ''
             lut_lmhead = f"_lut{params['lut_lmhead']}" if params['lut_lmhead'] != 'none' else ''
+            lut_embeddings = f"_lut{params['lut_embeddings']}" if params['lut_embeddings'] != 'none' else ''
             num_chunks = int(params['num_chunks'])
             
             # Set model paths if not specified
-            if not args.embed:
-                args.embed = f'{prefix}_embeddings'
             if not args.lmhead:
                 args.lmhead = f'{prefix}_lm_head{lut_lmhead}'
+            if not args.embed:
+                args.embed = f'{prefix}_embeddings{lut_embeddings}'  # Changed from lm_head to embeddings
             if not args.ffn:
                 args.ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
             if not args.tokenizer:
@@ -800,6 +849,9 @@ def main():
         # Create unified state once
         state = create_unified_state(ffn_models, metadata['context_length'])
         
+        # Initialize causal mask once
+        causal_mask = initialize_causal_mask(metadata['context_length'])
+        
         # Warmup runs to prevent Python GIL issues with CoreML !
         if not args.nw:
             for i in range(2):
@@ -810,6 +862,7 @@ def main():
                     tokenizer=tokenizer,
                     metadata=metadata,
                     state=state,
+                    causal_mask=causal_mask,  # Pass the causal mask
                     warmup=True,
                     auto_prompt="who are you?"
                 )
@@ -822,8 +875,10 @@ def main():
             tokenizer=tokenizer,
             metadata=metadata,
             state=state,
+            causal_mask=causal_mask,  # Pass the causal mask
             warmup=False,
-            auto_prompt=args.prompt
+            auto_prompt=args.prompt,
+            save_file=args.save
         )
         
     except Exception as e:

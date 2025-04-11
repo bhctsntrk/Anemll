@@ -10,6 +10,7 @@ from coremltools.converters.mil import Builder as mb
 import numpy as np
 import torch
 import os
+import gc  # Added import for garbage collection
 from ..models.llama_model import (
     LlamaModel, 
     LlamaConfig, 
@@ -67,16 +68,16 @@ class LlamaConverter(BaseConverter):
         elif split_part == '2_prefill':
             return self.convert_prefill(self.model)
         elif split_part == '3':
-            return self.convert_lm_head(self.model)
+            return self.convert_lm_head(self.model, lut_bits=self.lut_bits)
         
         # Handle full model conversion
         elif split_part == '123':
             embeddings_model = self.convert_embeddings(self.model)
             transformer_model = self.convert_FFN(self.model)
-            lm_head_model = self.convert_lm_head(self.model)
+            lm_head_model = self.convert_lm_head(self.model, lut_bits=self.lut_bits)
             return [embeddings_model, transformer_model, lm_head_model]
         
-        self.postprocess()
+        self.postprocess(num_workers=None)
 
     def GetTransformerStates(model, part=None, prefix="model.model."):
         """Get the transformer states for CoreML conversion"""
@@ -385,10 +386,15 @@ class LlamaConverter(BaseConverter):
         
         print("Model preprocessing completed")
 
-    def postprocess(self):
-        """Postprocessing steps after conversion."""
+    def postprocess(self, num_workers=None):
+        """Postprocessing steps after conversion.
+        
+        Args:
+            num_workers: Optional number of workers for parallel processing.
+                        If None, uses default single worker.
+        """
         if self.converted_model is not None and self.lut_bits is not None:
-            print(f"Applying LUT quantization with {self.lut_bits} bits and {self.per_channel} channels per group...")
+            print(f"Applying LUT quantization with {self.lut_bits} bits and {self.per_channel} channels per group using {num_workers if num_workers else 1} worker(s)...")
             try:
                 # Set up quantization config
                 config = cto.coreml.OptimizationConfig(
@@ -397,7 +403,7 @@ class LlamaConverter(BaseConverter):
                         nbits=self.lut_bits,
                         granularity="per_grouped_channel",
                         group_size=self.per_channel,
-                        num_kmeans_workers=1  # Reduce to single worker to avoid pool issues
+                        num_kmeans_workers=num_workers if num_workers is not None else 1  # Use provided workers or default to 1
                     ),
                 )
                 
@@ -479,7 +485,7 @@ class LlamaConverter(BaseConverter):
         # Apply LUT quantization if specified
         if self.lut_bits:
             self.converted_model = mlmodel  # Set for postprocess
-            self.postprocess()
+            self.postprocess(num_workers=8)  # Allow passing num_workers if needed
             mlmodel = self.converted_model
         
         return mlmodel
@@ -567,6 +573,28 @@ class LlamaConverter(BaseConverter):
             minimum_deployment_target=ct.target.iOS18,
             convert_to="mlprogram"
         )
+        
+        # Apply LUT quantization if specified
+        if lut_bits is not None:
+            print(f"Applying LUT quantization with {lut_bits} bits...")
+            try:
+                # Set up quantization config
+                config = cto.coreml.OptimizationConfig(
+                    global_config=cto.coreml.OpPalettizerConfig(
+                        mode="kmeans",
+                        nbits=lut_bits,
+                        granularity="per_grouped_channel",
+                        group_size=self.per_channel,
+                        num_kmeans_workers=8
+                    ),
+                )
+                
+                # Apply quantization
+                mlmodel = cto.coreml.palettize_weights(mlmodel, config)
+                print("LUT quantization completed")
+            except Exception as e:
+                print(f"Warning: LUT quantization failed: {str(e)}")
+                print("Continuing with unquantized model...")
         
         return mlmodel
 
@@ -670,7 +698,7 @@ class LlamaConverter(BaseConverter):
             # Apply LUT quantization if specified
             if self.lut_bits:
                 self.converted_model = mlmodel
-                self.postprocess()
+                self.postprocess(num_workers=None)  # Allow passing num_workers if needed
                 mlmodel = self.converted_model
             
             return mlmodel
@@ -774,7 +802,7 @@ class LlamaConverter(BaseConverter):
             # Apply LUT quantization if specified
             if self.lut_bits:
                 self.converted_model = mlmodel
-                self.postprocess()
+                self.postprocess(num_workers=None)  # Allow passing num_workers if needed
                 mlmodel = self.converted_model
             
             return mlmodel
@@ -840,6 +868,9 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
         num_chunks=num_chunks
     )
     
+    # Initialize converted_model as None
+    converted_model = None
+    
     # Handle FFN and prefill conversions (both chunked and non-chunked)
     if split_part in ['2', '2_prefill']:
         converted_models = []
@@ -855,7 +886,6 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
             print(f"\nConverting chunk {i+1}/{num_chunks}")
             
             # Clean up before converting next chunk
-            import gc
             gc.collect()
             
             # For single chunk (num_chunks=1), don't pass chunk_idx
@@ -890,10 +920,9 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
             import time
             time.sleep(1)
             
-        return converted_models
+        converted_model = converted_models
     else:
         # Convert model based on split_part
-        
         if split_part == '1':
             base_name = f'{prefix}_embeddings'
         elif split_part == '3':
@@ -907,11 +936,9 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
             base_name += f'_lut{lut_bits}'
         output_path = f"{base_name}.mlpackage"
 
-
         print(f"\nConverting model part: {split_part} output_path: {output_path}")
         converted_model = converter.convert(split_part=split_part)
-        #print(f"converted_model: {converted_model}")
-        
+
         # Add metadata before saving
         if output_path:
             if isinstance(converted_model, list):
@@ -940,7 +967,9 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
                 print(f"Saving model to {output_path}")
                 output_path = os.path.join(output_dir, output_path)
                 converted_model.save(output_path)
-        
+
+    # Model verification
+    if converted_model is not None:
         print("\nModel verification:")
         if isinstance(converted_model, list):
             # For multi-part models, use chunk numbers instead of hardcoded component names
@@ -951,8 +980,15 @@ def test_conversion(model_path=None, output_path=None, context_length=512, lut_b
         else:
             print(f"Input names: {converted_model.input_description}")
             print(f"Output names: {converted_model.output_description}")
-        
-        return converted_model
+
+        # Cleanup after verification
+        if not isinstance(converted_model, list):
+            temp_model = converted_model
+            del converted_model
+            gc.collect()
+            converted_model = temp_model
+
+    return converted_model
 
 def main():
     args = parse_args()
