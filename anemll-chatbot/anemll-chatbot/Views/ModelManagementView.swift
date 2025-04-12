@@ -2332,39 +2332,13 @@ struct ModelInfoSheet: View {
     var body: some View {
         NavigationView {
             List {
-                Section(header: Text("Basic Information")) {
-                    infoRow(title: "Name", value: model.name)
-                    infoRow(title: "ID", value: model.id)
-                    infoRow(title: "Size", value: formatFileSize(model.size))
-                    if !model.description.isEmpty {
-                        infoRow(title: "Description", value: model.description)
-                    }
-                    infoRow(title: "Status", value: model.isDownloaded ? "Downloaded" : "Not Downloaded")
-                }
-                
-                if isLoadingInfo {
-                    Section(header: Text("Additional Details")) {
-                        HStack {
-                            Text("Loading information...")
-                            Spacer()
-                            ProgressView()
-                        }
-                    }
-                } else if !additionalInfo.isEmpty {
-                    Section(header: Text("Additional Details")) {
-                        ForEach(additionalInfo.sorted(by: { $0.key < $1.key }), id: \.key) { key, value in
-                            infoRow(title: formatInfoKey(key), value: value)
-                        }
-                    }
-                }
-                
                 if model.isDownloaded {
                     Section(header: Text("Verification")) {
                         Button(action: {
                             verifySizes()
                         }) {
                             HStack {
-                                Text("Verify Model Size")
+                                Text("Verify files and size")
                                     .foregroundColor(.blue)
                                 Spacer()
                                 if isVerifyingSizes {
@@ -2393,6 +2367,32 @@ struct ModelInfoSheet: View {
                                     .font(.system(.footnote, design: .monospaced))
                             }
                             .padding(.vertical, 4)
+                        }
+                    }
+                }
+                
+                Section(header: Text("Basic Information")) {
+                    infoRow(title: "Name", value: model.name)
+                    infoRow(title: "ID", value: model.id)
+                    infoRow(title: "Size", value: formatFileSize(model.size))
+                    if !model.description.isEmpty {
+                        infoRow(title: "Description", value: model.description)
+                    }
+                    infoRow(title: "Status", value: model.isDownloaded ? "Downloaded" : "Not Downloaded")
+                }
+                
+                if isLoadingInfo {
+                    Section(header: Text("Additional Details")) {
+                        HStack {
+                            Text("Loading information...")
+                            Spacer()
+                            ProgressView()
+                        }
+                    }
+                } else if !additionalInfo.isEmpty {
+                    Section(header: Text("Additional Details")) {
+                        ForEach(additionalInfo.sorted(by: { $0.key < $1.key }), id: \.key) { key, value in
+                            infoRow(title: formatInfoKey(key), value: value)
                         }
                     }
                 }
@@ -2441,13 +2441,77 @@ struct ModelInfoSheet: View {
         
         // Run verification in background
         Task {
-            let (isValid, _, sizeInfo) = modelService.verifyModelSizes(modelId: model.id)
-            
-            // Update UI on main thread
-            await MainActor.run {
-                sizeVerificationResults = sizeInfo
-                sizeVerificationIsValid = isValid
-                isVerifyingSizes = false
+            do {
+                // First do a detailed verification to get missing files
+                let verificationDetails = modelService.verifyModelWithDetails(modelId: model.id, verbose: true)
+                let missingFiles = verificationDetails.missingFiles
+                let actualSize = verificationDetails.actualSize
+                let expectedSize = model.size
+                let sizePercentage = Float(actualSize) / Float(expectedSize) * 100.0
+                
+                // Build complete verification results
+                var completeResults = "📊 Size Verification:\n"
+                completeResults += "  - Expected size: \(formatFileSize(expectedSize))\n"
+                completeResults += "  - Actual size: \(formatFileSize(actualSize))\n"
+                completeResults += "  - Completeness: \(String(format: "%.1f", sizePercentage))%\n"
+                completeResults += "  - Size validation: \(sizePercentage >= 95.0 ? "✅" : "❌") \(sizePercentage >= 95.0 ? "Valid" : "Invalid")\n\n"
+                
+                // Get all .mlmodelc directories to check for missing weight files
+                let modelPath = modelService.getModelPath(for: model.id)
+                let fileManager = FileManager.default
+                
+                // Get contents of model directory
+                if let contents = try? fileManager.contentsOfDirectory(at: modelPath, includingPropertiesForKeys: nil) {
+                    var missingWeightFiles: [String] = []
+                    
+                    // Check each .mlmodelc directory for weight.bin
+                    for item in contents {
+                        if item.pathExtension == "mlmodelc" {
+                            let weightPath = item.appendingPathComponent("weights/weight.bin")
+                            if !fileManager.fileExists(atPath: weightPath.path) {
+                                // Store relative path for cleaner display
+                                let relativePath = item.lastPathComponent + "/weights/weight.bin"
+                                missingWeightFiles.append(relativePath)
+                            }
+                        }
+                    }
+                    
+                    // Add missing files section if any weight files are missing
+                    if !missingWeightFiles.isEmpty {
+                        completeResults += "❌ MISSING WEIGHT FILES:\n"
+                        completeResults += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        for file in missingWeightFiles {
+                            completeResults += "❌ Critical file missing: \(file)\n"
+                        }
+                    }
+                    
+                    // Add other missing files if any
+                    let otherMissingFiles = missingFiles.filter { !missingWeightFiles.contains($0) }
+                    if !otherMissingFiles.isEmpty {
+                        if !missingWeightFiles.isEmpty {
+                            completeResults += "\n"
+                        }
+                        completeResults += "❌ OTHER MISSING FILES:\n"
+                        completeResults += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        for file in otherMissingFiles {
+                            completeResults += "❌ \(file)\n"
+                        }
+                    }
+                }
+                
+                // Update UI on main thread
+                await MainActor.run {
+                    sizeVerificationResults = completeResults
+                    // Model is valid only if size is good AND no missing files
+                    sizeVerificationIsValid = sizePercentage >= 95.0 && missingFiles.isEmpty
+                    isVerifyingSizes = false
+                }
+            } catch {
+                await MainActor.run {
+                    sizeVerificationResults = "Error during verification: \(error.localizedDescription)"
+                    sizeVerificationIsValid = false
+                    isVerifyingSizes = false
+                }
             }
         }
     }

@@ -37,6 +37,11 @@ The sample applications demonstrate how to integrate ANEMLL models into iOS and 
 - 3B models: Requires device with 8GB RAM
 - 8B DeepSeek models: Only compatible with iPad Pro 16GB variants
 
+## Known issues and limitations
+- Memory Management: The application cannot pre-determine if a model will fit in device memory. On iOS/iPadOS devices, the operating system may terminate applications that sustain high memory usage, which could manifest as an app crash.
+- Download Issues: If model downloads fail, you can use either the "Resume Download" option to continue from the last successful point, or "Force-Redownload" to start fresh.
+- CoreML cache.
+
 ## Configuration
 
 ### 1. Project Setup

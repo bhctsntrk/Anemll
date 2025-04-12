@@ -126,13 +126,11 @@ struct HomeView: View {
             // Inform the coordinator that the view has been dismissed
             ModelManagementCoordinator.didDismiss()
             
-            // Check if we still need a model after dismissal
-            let needModel = modelService.getSelectedModel() == nil || 
-                          (modelService.getSelectedModel() != nil && 
-                           !modelService.verifyModelFiles(modelId: modelService.getSelectedModel()!.id))
+            // Only check for model validity on initial app launch or when no model is selected
+            let needModel = modelService.getSelectedModel() == nil
             
             if needModel {
-                print("DEBUG: Model still required after dismiss attempt from HomeView")
+                print("DEBUG: No model selected, showing model management view from HomeView")
                 // Add delay before attempting to show again to avoid presentation conflicts
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                     Task { @MainActor in
@@ -143,14 +141,12 @@ struct HomeView: View {
                     }
                 }
             } else {
-                print("DEBUG: Model verification successful, HomeView ModelManagementView dismissed")
+                print("DEBUG: Model management view dismissed by user")
             }
         }) {
             ModelManagementView()
                 .id(UUID()) // Force a fresh instance each time
-                .interactiveDismissDisabled(modelService.getSelectedModel() == nil || 
-                                           (modelService.getSelectedModel() != nil && 
-                                            !modelService.verifyModelFiles(modelId: modelService.getSelectedModel()!.id)))
+                .interactiveDismissDisabled(modelService.getSelectedModel() == nil)
                 .onAppear {
                     print("DEBUG: ModelManagementView appeared from HomeView")
                 }

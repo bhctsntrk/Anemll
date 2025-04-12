@@ -68,33 +68,28 @@ struct ChatView: View {
                 // Inform the coordinator that the view has been dismissed
                 ModelManagementCoordinator.didDismiss()
                 
-                // Check if we still need a model after dismissal
-                let needModel = modelService.getSelectedModel() == nil || 
-                              (modelService.getSelectedModel() != nil && 
-                               !modelService.verifyModelFiles(modelId: modelService.getSelectedModel()!.id))
+                // Only check for model validity on initial app launch or when no model is selected
+                let needModel = modelService.getSelectedModel() == nil
                 
                 if needModel {
-                    print("DEBUG: Model still required after dismiss attempt from ChatView")
+                    print("DEBUG: No model selected, showing model management view from ChatView")
                     // Add delay before attempting to show again to avoid presentation conflicts
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                         Task { @MainActor in
                             if ModelManagementCoordinator.canPresent() {
-                                print("DEBUG: Re-showing ModelManagementView after failed dismiss")
+                                print("DEBUG: Re-showing ModelManagementView after failed dismiss from ChatView")
                                 showModelManagement = true
                             }
                         }
                     }
                 } else {
-                    // Keep the view dismissed
-                    print("DEBUG: Model verification successful, ChatView ModelManagementView dismissed")
+                    print("DEBUG: Model management view dismissed by user")
                 }
             }) { 
                 // Create a new instance each time with a unique ID to avoid state persistence issues
                 ModelManagementView()
                     .id(UUID()) // Force a fresh instance each time
-                    .interactiveDismissDisabled(modelService.getSelectedModel() == nil || 
-                                              (modelService.getSelectedModel() != nil && 
-                                               !modelService.verifyModelFiles(modelId: modelService.getSelectedModel()!.id))) // Only allow dismiss if there's a valid model
+                    .interactiveDismissDisabled(modelService.getSelectedModel() == nil)
                     .onAppear {
                         print("DEBUG: ModelManagementView appeared from ChatView")
                         // Ensure keyboard is dismissed when sheet appears
