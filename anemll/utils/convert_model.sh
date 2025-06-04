@@ -23,6 +23,9 @@ NUM_CHUNKS=2   # Default number of chunks
 # Initialize SKIP_CHECK before parsing arguments
 SKIP_CHECK=false
 
+# Select converter based on prefix
+CONVERTER="python -m anemll.ane_converter.llama_converter"
+
 # Initialize SKIP_CHECK before parsing arguments
 SKIP_CHECK=false
 
@@ -51,6 +54,9 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --prefix)
             PREFIX="$2"
+            if [ "$PREFIX" = "qwen" ]; then
+                CONVERTER="python -m anemll.ane_converter.qwen_converter"
+            fi
             shift 2
             ;;
         --model)
@@ -193,7 +199,7 @@ if [ ! -z "$LUT_PART1" ]; then
 fi
 
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "1" ]; then
-    run_step 1 "Converting Embeddings" "python -m anemll.ane_converter.llama_converter \
+    run_step 1 "Converting Embeddings" "$CONVERTER \
         --part 1 \
         $LUT1_PARAM \
         --context-length $CONTEXT_LENGTH \
@@ -214,7 +220,7 @@ if [ ! -z "$LUT_PART3" ]; then
 fi
 
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
-    run_step 2 "Converting LM Head" "python -m anemll.ane_converter.llama_converter \
+    run_step 2 "Converting LM Head" "$CONVERTER \
         --part 3 \
         $LUT3_PARAM \
         --context-length $CONTEXT_LENGTH \
@@ -233,7 +239,7 @@ if [ ! -z "$LUT_PART2" ]; then
 fi
 
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
-    run_step 3 "Converting FFN" "python -m anemll.ane_converter.llama_converter \
+    run_step 3 "Converting FFN" "$CONVERTER \
         --part 2 \
         $LUT2_PARAM \
         --chunk $NUM_CHUNKS \
@@ -247,7 +253,7 @@ else
 fi
 
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
-    run_step 4 "Converting Prefill" "python -m anemll.ane_converter.llama_converter \
+    run_step 4 "Converting Prefill" "$CONVERTER \
         --part 2_prefill \
         $LUT2_PARAM \
         --chunk $NUM_CHUNKS \

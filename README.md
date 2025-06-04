@@ -43,6 +43,7 @@ ANEMLL provides five main components for Apple Neural Engine inference developme
 
 We provide sample converted models ready for use:
 - LLAMA 3.1 (1B and 8B variants) including iOS "friendly builds"
+- Qwen 3 (0.6B and 8B)
 - DeepSeek  distilled models
 - DeepHermes distilled models
 > [!NOTE]

@@ -286,7 +286,9 @@ class LlamaMLP(nn.Module):
             b = self.up_proj(x)
 
         c = self.act_fn(a)
-        d = c * b       if MLP_DOWN_SPLIT > 1:
+        d = c * b
+
+        if MLP_DOWN_SPLIT > 1:
             e_splits = [down_proj(d) for down_proj in self.down_projs]
             e = torch.cat(e_splits, dim=1)
         else:
