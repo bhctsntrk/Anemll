@@ -20,6 +20,9 @@ MODEL_PATH=""
 OUTPUT_DIR=""
 NUM_CHUNKS=2   # Default number of chunks
 
+# Converter command, determined later
+CONVERTER="python -m anemll.ane_converter.llama_converter"
+
 # Initialize SKIP_CHECK before parsing arguments
 SKIP_CHECK=false
 
@@ -137,6 +140,17 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)" || {
     OUTPUT_DIR="$(cd "$(dirname "$OUTPUT_DIR")" && pwd)/$(basename "$OUTPUT_DIR")"
 }
 
+# Detect architecture from config.json to choose converter
+CONFIG_FILE="$MODEL_PATH/config.json"
+if [ -f "$CONFIG_FILE" ]; then
+    ARCH=$(jq -r '.model_type // (.architectures[0] // "")' "$CONFIG_FILE" | tr '[:upper:]' '[:lower:]')
+    if [[ "$ARCH" == qwen* ]]; then
+        CONVERTER="python -m anemll.ane_converter.qwen_converter"
+    else
+        CONVERTER="python -m anemll.ane_converter.llama_converter"
+    fi
+fi
+
 # Step 0: Check dependencies
 if [ "$SKIP_CHECK" = false ]; then
     "$SCRIPT_DIR/check_dependencies.sh" --model "$MODEL_PATH" --output "$OUTPUT_DIR" "$@"
@@ -193,7 +207,7 @@ if [ ! -z "$LUT_PART1" ]; then
 fi
 
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "1" ]; then
-    run_step 1 "Converting Embeddings" "python -m anemll.ane_converter.llama_converter \
+    run_step 1 "Converting Embeddings" "$CONVERTER \
         --part 1 \
         $LUT1_PARAM \
         --context-length $CONTEXT_LENGTH \
@@ -214,7 +228,7 @@ if [ ! -z "$LUT_PART3" ]; then
 fi
 
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
-    run_step 2 "Converting LM Head" "python -m anemll.ane_converter.llama_converter \
+    run_step 2 "Converting LM Head" "$CONVERTER \
         --part 3 \
         $LUT3_PARAM \
         --context-length $CONTEXT_LENGTH \
@@ -233,7 +247,7 @@ if [ ! -z "$LUT_PART2" ]; then
 fi
 
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
-    run_step 3 "Converting FFN" "python -m anemll.ane_converter.llama_converter \
+    run_step 3 "Converting FFN" "$CONVERTER \
         --part 2 \
         $LUT2_PARAM \
         --chunk $NUM_CHUNKS \
@@ -247,7 +261,7 @@ else
 fi
 
 if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
-    run_step 4 "Converting Prefill" "python -m anemll.ane_converter.llama_converter \
+    run_step 4 "Converting Prefill" "$CONVERTER \
         --part 2_prefill \
         $LUT2_PARAM \
         --chunk $NUM_CHUNKS \
