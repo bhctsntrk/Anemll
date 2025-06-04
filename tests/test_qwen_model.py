@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 
 from anemll.models.qwen_model import (
     QwenConfig,
@@ -11,8 +12,14 @@ import sys
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent))
-from test_py_llama import make_causal_mask
 
+def make_causal_mask(length, start):
+    """Create causal attention mask."""
+    mask = np.full((1, 1, length, length), -np.inf, dtype=np.float16)
+    row_indices = np.arange(length).reshape(length, 1)
+    col_indices = np.arange(length).reshape(1, length)
+    mask[:, :, col_indices <= (row_indices + start)] = 0
+    return torch.tensor(mask, dtype=torch.float16)
 
 def test_qwen_forward_small():
     config = QwenConfig(
