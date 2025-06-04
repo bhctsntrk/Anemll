@@ -23,7 +23,7 @@ NUM_CHUNKS=2   # Default number of chunks
 # Initialize SKIP_CHECK before parsing arguments
 SKIP_CHECK=false
 
-# Select converter based on prefix
+# Default converter; may be overridden after parsing config.json
 CONVERTER="python -m anemll.ane_converter.llama_converter"
 
 # Initialize SKIP_CHECK before parsing arguments
@@ -54,9 +54,6 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --prefix)
             PREFIX="$2"
-            if [ "$PREFIX" = "qwen" ]; then
-                CONVERTER="python -m anemll.ane_converter.qwen_converter"
-            fi
             shift 2
             ;;
         --model)
@@ -142,6 +139,17 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)" || {
     # If output directory doesn't exist, get absolute path another way
     OUTPUT_DIR="$(cd "$(dirname "$OUTPUT_DIR")" && pwd)/$(basename "$OUTPUT_DIR")"
 }
+
+# Detect architecture from config.json
+CONFIG_FILE="$MODEL_PATH/config.json"
+if [ -f "$CONFIG_FILE" ]; then
+    ARCH=$(jq -r '.model_type // (.architectures[0] // "")' "$CONFIG_FILE" | tr '[:upper:]' '[:lower:]')
+    if [[ "$ARCH" == qwen* ]]; then
+        CONVERTER="python -m anemll.ane_converter.qwen_converter"
+    else
+        CONVERTER="python -m anemll.ane_converter.llama_converter"
+    fi
+fi
 
 # Step 0: Check dependencies
 if [ "$SKIP_CHECK" = false ]; then
