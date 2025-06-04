@@ -7,7 +7,11 @@ from anemll.models.qwen_model import (
     TEST_DEVICE,
     CONTEXT_LENGTH,
 )
-from tests.test_py_llama import make_causal_mask
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parent))
+from test_py_llama import make_causal_mask
 
 
 def test_qwen_forward_small():
