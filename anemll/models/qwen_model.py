@@ -44,6 +44,10 @@ class QwenConfig:
         self.num_attention_heads = kwargs.get("num_attention_heads", 32)
         self.num_hidden_layers = kwargs.get("num_hidden_layers", 32)
         self.num_key_value_heads = kwargs.get("num_key_value_heads", 8)
+        self.head_dim = kwargs.get(
+            "head_dim",
+            self.hidden_size // max(1, self.num_attention_heads),
+        )
         self.pretraining_tp = kwargs.get("pretraining_tp", 1)
         self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-05)
         self.rope_scaling = kwargs.get("rope_scaling", None)
@@ -103,7 +107,9 @@ class QwenRotaryEmbedding(nn.Module):
 
     def __init__(self, config: QwenConfig) -> None:
         super().__init__()
-        self.dim = config.hidden_size // config.num_attention_heads
+        self.dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
         inv_freq = 1.0 / (
             config.rope_theta ** (torch.arange(0, self.dim, 2).float() / self.dim)
         )
@@ -137,6 +143,14 @@ def apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    if n_rep == 1:
+        return hidden_states
+    bsz, n_kv, seq_len, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].repeat(1, 1, n_rep, 1, 1)
+    return hidden_states.view(bsz, n_kv * n_rep, seq_len, head_dim)
+
+
 class QwenMLP(nn.Module):
     def __init__(self, config: QwenConfig) -> None:
         super().__init__()
@@ -166,7 +180,7 @@ class QwenAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = self.hidden_size // self.num_heads
+        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
         self.rotary_emb = QwenRotaryEmbedding(config)
 
         self.q_proj = nn.Conv2d(
@@ -225,6 +239,10 @@ class QwenAttention(nn.Module):
             .view(bsz, self.num_kv_heads, self.head_dim, seq_len)
             .permute(0, 1, 3, 2)
         )
+
+        n_rep = self.num_heads // self.num_kv_heads
+        key_states = repeat_kv(key_states, n_rep)
+        value_states = repeat_kv(value_states, n_rep)
 
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
@@ -320,6 +338,8 @@ class QwenModel(nn.Module):
         conv_state = {}
         for k, v in state_dict.items():
             new_k = k.replace("model.", "") if k.startswith("model.") else k
+            if "lm_head.weight" in new_k:
+                continue
             if any(
                 proj in new_k
                 for proj in [
@@ -330,7 +350,6 @@ class QwenModel(nn.Module):
                     "gate_proj.weight",
                     "up_proj.weight",
                     "down_proj.weight",
-                    "lm_head.weight",
                 ]
             ):
                 conv_state[new_k] = v.view(v.shape[0], v.shape[1], 1, 1)
@@ -338,6 +357,7 @@ class QwenModel(nn.Module):
                 conv_state[new_k] = v
 
         missing, unexpected = self.load_state_dict(conv_state, strict=False)
+        missing = [m for m in missing if "rotary_emb.inv_freq" not in m]
         if missing or unexpected:
             print("Missing keys", missing)
             print("Unexpected keys", unexpected)
