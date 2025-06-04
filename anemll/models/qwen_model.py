@@ -315,10 +315,15 @@ class QwenModel(nn.Module):
         causal_mask: torch.Tensor,
         position_ids: torch.LongTensor,
         current_pos: torch.LongTensor,
+        IN_PREFILL: bool = False,
     ) -> torch.Tensor:
+        """Forward pass through the transformer layers."""
         hidden_states = self.embed_tokens(input_ids)
         for layer in self.layers:
             hidden_states = layer(hidden_states, causal_mask, position_ids, current_pos)
+        if IN_PREFILL:
+            # Skip final normalization when used only for cache priming
+            return hidden_states
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
@@ -383,9 +388,43 @@ class QwenForCausalLM(nn.Module):
         current_pos: torch.LongTensor,
         IN_PREFILL: bool = False,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, causal_mask, position_ids, current_pos)
+        assert len(input_ids.shape) == 2, "input_ids must be 2D"
+        if not IN_PREFILL:
+            assert position_ids.ndim in (1, 2), "position_ids must be 1D or 2D"
+        else:
+            assert (
+                position_ids.shape[-1] == input_ids.shape[-1]
+            ), "position_ids length must match input_ids in prefill"
+
+        hidden_states = self.model(
+            input_ids,
+            causal_mask,
+            position_ids,
+            current_pos,
+            IN_PREFILL=IN_PREFILL,
+        )
         logits = self.lm_head(hidden_states.permute(0, 2, 1).unsqueeze(2))
         return logits.squeeze(2).permute(0, 2, 1)
+
+    def prefill_kv_cache(
+        self,
+        input_ids: torch.LongTensor,
+        position_ids: torch.LongTensor,
+        start_pos: torch.LongTensor,
+        causal_mask: torch.Tensor,
+    ) -> None:
+        seq_len = input_ids.shape[1]
+        causal_slice = (
+            causal_mask[:, :, :seq_len, :] if causal_mask is not None else None
+        )
+        with torch.no_grad():
+            self.model(
+                input_ids,
+                causal_slice,
+                position_ids,
+                start_pos,
+                IN_PREFILL=True,
+            )
 
     def load_pretrained_weights(self, model_path: str) -> bool:
         if not self.model.load_pretrained_weights(model_path):
