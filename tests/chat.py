@@ -450,7 +450,7 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
     
     return torch.tensor([context_pos], dtype=torch.int32)
 
-def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, context_length, state=None, causal_mask=None, temperature=0.0):
+def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, context_length, metadata, state=None, causal_mask=None, temperature=0.0):
     """Generate the next token."""
     # Get current token
     current_token = input_ids[:, pos-1:pos]  # [1, 1]
@@ -490,11 +490,14 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
     # Debug print
     #print("\nLM Head output keys:", list(lm_output.keys()))
     
-    # Combine logits1-8 if they exist
+    # Get number of logits from metadata, default to 8
+    num_logits = metadata.get('num_logits', 8)
+    
+    # Combine logits1-N if they exist
     if 'logits1' in lm_output:
         # Concatenate all logits parts
         logits_parts = []
-        for i in range(1, 9):
+        for i in range(1, num_logits + 1):
             key = f'logits{i}'
             if key in lm_output:
                 logits_parts.append(torch.from_numpy(lm_output[key]))
@@ -631,6 +634,7 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                         input_ids,
                         pos,
                         context_length,
+                        metadata,
                         state,
                         causal_mask
                     )
@@ -745,6 +749,8 @@ def parse_args():
                        help='Context length for the model (default: 512), if not provided, it will be detected from the model directory name ctxNUMBER')
     parser.add_argument('--batch-size', type=int,
                        help='Batch size for prefill (default: 64)')
+    parser.add_argument('--num-logits', type=int, default=8,
+                       help='Number of logits outputs from LM head (default: 8)')
     
     args = parser.parse_args()
     
@@ -782,11 +788,15 @@ def parse_args():
             if args.batch_size is None:
                 args.batch_size = int(params['batch_size'])
             args.num_chunks = num_chunks
+            # Add num_logits parameter with default of 8, override command line if present in meta
+            if 'num_logits' in params:
+                args.num_logits = int(params['num_logits'])
             
             print(f"\nLoaded parameters from {args.meta}:")
             print(f"  Context Length: {args.context_length}")
             print(f"  Batch Size: {args.batch_size}")
             print(f"  Num Chunks: {args.num_chunks}")
+            print(f"  Num Logits: {args.num_logits}")
             print(f"  Models Directory: {args.d}")
             print(f"  Embeddings: {args.embed}")
             print(f"  LM Head: {args.lmhead}")
@@ -838,6 +848,9 @@ def main():
             metadata['context_length'] = args.context_length
             metadata['state_length'] = args.context_length  # Also update state_length
             print(f"\nOverriding context length from command line: {args.context_length}")
+        
+        # Add num_logits to metadata
+        metadata['num_logits'] = getattr(args, 'num_logits', 8)
         
         print(f"\nMetadata after load_models: {metadata}")
         

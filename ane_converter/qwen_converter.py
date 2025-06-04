@@ -50,9 +50,98 @@ class QwenConverter(BaseConverter):
     # ------------------------------------------------------------------
     def convert(self) -> ct.models.MLModel:
         """Convert the wrapped model to CoreML format."""
+        print("QwenConverter.convert() called")
+        print("Calling preprocess()...")
         self.preprocess()
+        print("Calling convert_to_coreml()...")
         mlmodel = self.convert_to_coreml(self.model)
+        print("Calling postprocess()...")
         self.postprocess()
+        print("QwenConverter.convert() completed")
+        return mlmodel
+
+    def convert_to_coreml(self, model: QwenForCausalLM) -> ct.models.MLModel:
+        """Convert the entire model to CoreML."""
+        print("Creating wrapper model...")
+
+        class Wrapper(torch.nn.Module):
+            def __init__(self, model: QwenForCausalLM) -> None:
+                super().__init__()
+                self.model = model
+
+            def forward(
+                self,
+                input_ids: torch.Tensor,
+                position_ids: torch.Tensor,
+                causal_mask: torch.Tensor,
+                current_pos: torch.Tensor,
+            ) -> torch.Tensor:
+                return self.model(
+                    input_ids=input_ids,
+                    update_mask=torch.zeros(
+                        (1, 1, CONTEXT_LENGTH, 1),
+                        dtype=MODEL_DTYPE,
+                        device=TEST_DEVICE,
+                    ),
+                    position_ids=position_ids,
+                    causal_mask=causal_mask,
+                    current_pos=current_pos,
+                    IN_PREFILL=False,
+                )
+
+        wrapper = Wrapper(model)
+        wrapper.eval()
+        print("Wrapper model created and set to eval mode")
+
+        sample_input_ids = torch.zeros((1, 1), dtype=torch.int32, device=TEST_DEVICE)
+        sample_position_ids = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
+        sample_causal_mask = torch.zeros(
+            (1, 1, 1, self.context_length), dtype=MODEL_DTYPE, device=TEST_DEVICE
+        )
+        sample_current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
+        print("Sample inputs created")
+        print("sample_input_ids shape:", sample_input_ids.shape)
+        print("sample_position_ids shape:", sample_position_ids.shape)
+        print("sample_causal_mask shape:", sample_causal_mask.shape)
+        print("sample_current_pos shape:", sample_current_pos.shape)
+
+        print("Starting torch.jit.trace...")
+        traced = torch.jit.trace(
+            wrapper,
+            (
+                sample_input_ids,
+                sample_position_ids,
+                sample_causal_mask,
+                sample_current_pos,
+            ),
+        )
+        print("torch.jit.trace completed!")
+
+        print("Starting CoreML conversion...")
+        mlmodel = ct.convert(
+            traced,
+            inputs=[
+                ct.TensorType(
+                    name="input_ids", shape=sample_input_ids.shape, dtype=np.int32
+                ),
+                ct.TensorType(
+                    name="position_ids", shape=sample_position_ids.shape, dtype=np.int32
+                ),
+                ct.TensorType(
+                    name="causal_mask", shape=sample_causal_mask.shape, dtype=np.float16
+                ),
+                ct.TensorType(
+                    name="current_pos", shape=sample_current_pos.shape, dtype=np.int32
+                ),
+            ],
+            outputs=[ct.TensorType(name="logits", dtype=np.float16)],
+            compute_precision=ct.precision.FLOAT16,
+            compute_units=ct.ComputeUnit.CPU_AND_NE,
+            minimum_deployment_target=ct.target.iOS18,
+            convert_to="mlprogram",
+        )
+        print("CoreML conversion completed!")
+
         return mlmodel
 
 
@@ -123,19 +212,28 @@ def test_conversion(
     output_dir: str = ".",
 ) -> ct.models.MLModel:
     """Convert a Qwen model and save the result."""
+    print(f"test_conversion called with model_path={model_path}, prefix={prefix}")
 
     if model is None:
         if model_path is None:
             raise ValueError("model_path must be provided if model is None")
 
         config_path = os.path.join(model_path, "config.json")
+        print(f"Looking for config at: {config_path}")
         if not os.path.exists(config_path):
             raise ValueError(f"Config file not found at {config_path}")
 
+        print("Loading config...")
         config = QwenConfig.from_json(config_path)
+        print(f"Config loaded: hidden_size={config.hidden_size}, vocab_size={config.vocab_size}")
+        
+        print("Creating model...")
         model = QwenForCausalLM(config)
+        print("Loading pretrained weights...")
         model.load_pretrained_weights(model_path)
+        print("Model loaded successfully!")
 
+    print("Creating converter...")
     converter = QwenConverter(
         model=model,
         context_length=context_length,
@@ -143,16 +241,23 @@ def test_conversion(
         lut_bits=lut_bits,
     )
 
+    print("Starting conversion...")
     mlmodel = converter.convert()
+    print("Conversion completed!")
 
+    print(f"Creating output directory: {output_dir}")
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, f"{prefix}.mlpackage")
+    print(f"Saving model to: {out_path}")
     mlmodel.save(out_path)
+    print("Model saved successfully!")
     return mlmodel
 
 
 def main() -> None:
+    print("Starting qwen_converter main()...")
     args = parse_args()
+    print(f"Parsed args: {args}")
 
     model_path = args.model if args.model else "Qwen/Qwen3-0.6B"
 
@@ -167,7 +272,8 @@ def main() -> None:
     print(f"Converting part(s): {args.part}")
 
     try:
-        test_conversion(
+        print("\nCalling test_conversion()...")
+        result = test_conversion(
             model_path=model_path,
             prefix=args.prefix,
             context_length=args.context_length,
@@ -175,6 +281,7 @@ def main() -> None:
             batch_size=args.batch_size,
             output_dir=args.output,
         )
+        print(f"Conversion completed successfully! Result: {type(result)}")
     except Exception as e:  # pragma: no cover - CLI tool
         print(f"\nError during conversion: {str(e)}")
         import traceback
@@ -183,84 +290,5 @@ def main() -> None:
         raise SystemExit(1)
 
 
-if __name__ == "__main__":  # pragma: no cover - CLI entry point
-    main()
-
-    # to RUN
-    # python -m anemll.ane_converter.qwen_converter
-
-    # ------------------------------------------------------------------
-    # Conversion helpers
-    # ------------------------------------------------------------------
-    def convert_to_coreml(self, model: QwenForCausalLM) -> ct.models.MLModel:
-        """Convert the entire model to CoreML."""
-
-        class Wrapper(torch.nn.Module):
-            def __init__(self, model: QwenForCausalLM) -> None:
-                super().__init__()
-                self.model = model
-
-            def forward(
-                self,
-                input_ids: torch.Tensor,
-                position_ids: torch.Tensor,
-                causal_mask: torch.Tensor,
-                current_pos: torch.Tensor,
-            ) -> torch.Tensor:
-                return self.model(
-                    input_ids=input_ids,
-                    update_mask=torch.zeros(
-                        (1, 1, CONTEXT_LENGTH, 1),
-                        dtype=MODEL_DTYPE,
-                        device=TEST_DEVICE,
-                    ),
-                    position_ids=position_ids,
-                    causal_mask=causal_mask,
-                    current_pos=current_pos,
-                    IN_PREFILL=False,
-                )
-
-        wrapper = Wrapper(model)
-        wrapper.eval()
-
-        sample_input_ids = torch.zeros((1, 1), dtype=torch.int32, device=TEST_DEVICE)
-        sample_position_ids = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
-        sample_causal_mask = torch.zeros(
-            (1, 1, 1, self.context_length), dtype=MODEL_DTYPE, device=TEST_DEVICE
-        )
-        sample_current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
-
-        traced = torch.jit.trace(
-            wrapper,
-            (
-                sample_input_ids,
-                sample_position_ids,
-                sample_causal_mask,
-                sample_current_pos,
-            ),
-        )
-
-        mlmodel = ct.convert(
-            traced,
-            inputs=[
-                ct.TensorType(
-                    name="input_ids", shape=sample_input_ids.shape, dtype=np.int32
-                ),
-                ct.TensorType(
-                    name="position_ids", shape=sample_position_ids.shape, dtype=np.int32
-                ),
-                ct.TensorType(
-                    name="causal_mask", shape=sample_causal_mask.shape, dtype=np.float16
-                ),
-                ct.TensorType(
-                    name="current_pos", shape=sample_current_pos.shape, dtype=np.int32
-                ),
-            ],
-            outputs=[ct.TensorType(name="logits", dtype=np.float16)],
-            compute_precision=ct.precision.FLOAT16,
-            compute_units=ct.ComputeUnit.CPU_AND_NE,
-            minimum_deployment_target=ct.target.iOS18,
-            convert_to="mlprogram",
-        )
-
-        return mlmodel
+if __name__ == "__main__":
+    main() 

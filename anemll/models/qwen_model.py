@@ -27,6 +27,14 @@ MODEL_DTYPE = torch.float16
 TEST_DEVICE = "cpu"
 CONTEXT_LENGTH = 512
 
+# LM head configuration constants (following llama_model.py pattern)
+ENABLE_CONV2D = bool(1)      # Use Conv2d for LM head
+ENABLE_VACAB_SPLIT = bool(1)  # Split vocab into 2 parts
+ENABLE_VACAB_SPLIT8 = bool(0)  # Split vocab into 8 parts
+ENABLE_VACAB_SPLIT16 = bool(1)  # Split vocab into 16 parts
+ENABLE_LOGITS2 = bool(1)    # Return separate logits arrays for CoreML
+ENABLE_COREML = bool(0)     # CoreML-specific returns
+
 
 class QwenConfig:
     def __init__(self, **kwargs):
@@ -256,7 +264,9 @@ class QwenAttention(nn.Module):
             torch.matmul(query_states, key_states.transpose(-2, -1)) * self.scale
         )
         if causal_mask is not None:
-            attn_weights = attn_weights + causal_mask.to(attn_weights.dtype)
+            # Slice causal mask to match seq_len x seq_len for attention weights
+            causal_mask_slice = causal_mask[:, :, :seq_len, :seq_len]
+            attn_weights = attn_weights + causal_mask_slice.to(attn_weights.dtype)
         attn_weights = torch.softmax(attn_weights, dim=-1)
         attn_output = torch.matmul(attn_weights, value_states)
         attn_output = (
@@ -372,12 +382,45 @@ class QwenModel(nn.Module):
 class QwenForCausalLM(nn.Module):
     config_class = QwenConfig
 
-    def __init__(self, config: QwenConfig, **kwargs) -> None:
+    def __init__(self, config: QwenConfig, enable_coreml=False, **kwargs) -> None:
         super().__init__()
+        self.config = config
+        self.enable_coreml = enable_coreml
         self.model = QwenModel(config)
-        self.lm_head = nn.Conv2d(
-            config.hidden_size, config.vocab_size, 1, bias=False, dtype=MODEL_DTYPE
-        ).to(TEST_DEVICE)
+        
+        # Initialize lm_head as Conv2d for ANE optimization following llama_model.py pattern
+        if ENABLE_CONV2D:
+            if ENABLE_VACAB_SPLIT16:
+                vocab_split = config.vocab_size // 16
+                vocab_remainder = config.vocab_size % 16
+                # Create 16 heads, with the first ones handling any remainder
+                for i in range(16):
+                    split_size = vocab_split + (1 if i < vocab_remainder else 0)
+                    setattr(self, f"lm_head16_{i+1}", 
+                           nn.Conv2d(config.hidden_size, split_size, 1, bias=False, dtype=MODEL_DTYPE).to(TEST_DEVICE))
+                print("Created lm_head16_1 through lm_head16_16")
+            elif ENABLE_VACAB_SPLIT8:
+                vocab_split = config.vocab_size // 8
+                vocab_remainder = config.vocab_size % 8
+                # Create 8 heads, with the last one handling any remainder
+                for i in range(8):
+                    split_size = vocab_split + (1 if i < vocab_remainder else 0)
+                    setattr(self, f"lm_head8_{i+1}", 
+                           nn.Conv2d(config.hidden_size, split_size, 1, bias=False, dtype=MODEL_DTYPE).to(TEST_DEVICE))
+                print("Created lm_head8_1 through lm_head8_8")
+            elif ENABLE_VACAB_SPLIT:
+                self.lm_head2_1 = nn.Conv2d(config.hidden_size, config.vocab_size//2, 1, bias=False, dtype=MODEL_DTYPE).to(TEST_DEVICE)
+                self.lm_head2_2 = nn.Conv2d(config.hidden_size, config.vocab_size//2, 1, bias=False, dtype=MODEL_DTYPE).to(TEST_DEVICE)
+                print("Created lm_head2_1 and lm_head2_2")
+            else:
+                self.lm_head1 = nn.Conv2d(config.hidden_size, config.vocab_size, 1, bias=False, dtype=MODEL_DTYPE).to(TEST_DEVICE)
+                print("Created lm_head1")
+        else:
+            # Use linear head
+            self.lm_head = nn.Conv2d(
+                config.hidden_size, config.vocab_size, 1, bias=False, dtype=MODEL_DTYPE
+            ).to(TEST_DEVICE)
+            print("Created linear lm_head")
 
     def forward(
         self,
@@ -403,8 +446,71 @@ class QwenForCausalLM(nn.Module):
             current_pos,
             IN_PREFILL=IN_PREFILL,
         )
-        logits = self.lm_head(hidden_states.permute(0, 2, 1).unsqueeze(2))
-        return logits.squeeze(2).permute(0, 2, 1)
+        
+        # Project to vocabulary using appropriate head
+        if ENABLE_CONV2D:
+            # Reshape for Conv2d and ensure float16
+            hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2).to(MODEL_DTYPE)
+            
+            if ENABLE_VACAB_SPLIT16:
+                # Use 16-way split head
+                logits1 = self.lm_head16_1(hidden_states).squeeze(2).transpose(1, 2)
+                logits2 = self.lm_head16_2(hidden_states).squeeze(2).transpose(1, 2)
+                logits3 = self.lm_head16_3(hidden_states).squeeze(2).transpose(1, 2)
+                logits4 = self.lm_head16_4(hidden_states).squeeze(2).transpose(1, 2)
+                logits5 = self.lm_head16_5(hidden_states).squeeze(2).transpose(1, 2)
+                logits6 = self.lm_head16_6(hidden_states).squeeze(2).transpose(1, 2)
+                logits7 = self.lm_head16_7(hidden_states).squeeze(2).transpose(1, 2)
+                logits8 = self.lm_head16_8(hidden_states).squeeze(2).transpose(1, 2)
+                logits9 = self.lm_head16_9(hidden_states).squeeze(2).transpose(1, 2)
+                logits10 = self.lm_head16_10(hidden_states).squeeze(2).transpose(1, 2)
+                logits11 = self.lm_head16_11(hidden_states).squeeze(2).transpose(1, 2)
+                logits12 = self.lm_head16_12(hidden_states).squeeze(2).transpose(1, 2)
+                logits13 = self.lm_head16_13(hidden_states).squeeze(2).transpose(1, 2)
+                logits14 = self.lm_head16_14(hidden_states).squeeze(2).transpose(1, 2)
+                logits15 = self.lm_head16_15(hidden_states).squeeze(2).transpose(1, 2)
+                logits16 = self.lm_head16_16(hidden_states).squeeze(2).transpose(1, 2)
+                
+                if self.enable_coreml and ENABLE_LOGITS2:
+                    return logits1, logits2, logits3, logits4, logits5, logits6, logits7, logits8, logits9, logits10, logits11, logits12, logits13, logits14, logits15, logits16
+                else:
+                    logits = torch.cat([logits1, logits2, logits3, logits4, logits5, logits6, logits7, logits8, logits9, logits10, logits11, logits12, logits13, logits14, logits15, logits16], dim=2)
+            
+            elif ENABLE_VACAB_SPLIT8:
+                # Use 8-way split head
+                logits1 = self.lm_head8_1(hidden_states).squeeze(2).transpose(1, 2)
+                logits2 = self.lm_head8_2(hidden_states).squeeze(2).transpose(1, 2)
+                logits3 = self.lm_head8_3(hidden_states).squeeze(2).transpose(1, 2)
+                logits4 = self.lm_head8_4(hidden_states).squeeze(2).transpose(1, 2)
+                logits5 = self.lm_head8_5(hidden_states).squeeze(2).transpose(1, 2)
+                logits6 = self.lm_head8_6(hidden_states).squeeze(2).transpose(1, 2)
+                logits7 = self.lm_head8_7(hidden_states).squeeze(2).transpose(1, 2)
+                logits8 = self.lm_head8_8(hidden_states).squeeze(2).transpose(1, 2)
+                
+                if self.enable_coreml and ENABLE_LOGITS2:
+                    return logits1, logits2, logits3, logits4, logits5, logits6, logits7, logits8
+                else:
+                    logits = torch.cat([logits1, logits2, logits3, logits4, logits5, logits6, logits7, logits8], dim=2)
+            
+            elif ENABLE_VACAB_SPLIT:
+                # Use 2-way split head
+                logits1 = self.lm_head2_1(hidden_states).squeeze(2).transpose(1, 2)
+                logits2 = self.lm_head2_2(hidden_states).squeeze(2).transpose(1, 2)
+                
+                if self.enable_coreml and ENABLE_LOGITS2:
+                    return logits1, logits2
+                
+                logits = torch.cat([logits1, logits2], dim=2)
+            
+            else:
+                # Use single head
+                logits = self.lm_head1(hidden_states).squeeze(2).transpose(1, 2)
+        else:
+            # Use linear head (fallback)
+            logits = self.lm_head(hidden_states.permute(0, 2, 1).unsqueeze(2))
+            logits = logits.squeeze(2).permute(0, 2, 1)
+        
+        return logits
 
     def prefill_kv_cache(
         self,
@@ -429,10 +535,56 @@ class QwenForCausalLM(nn.Module):
     def load_pretrained_weights(self, model_path: str) -> bool:
         if not self.model.load_pretrained_weights(model_path):
             return False
-        path = os.path.join(model_path, "model.safetensors")
-        if os.path.exists(path):
-            state = safetensors.torch.load_file(path)
-            w = state.get("lm_head.weight")
-            if w is not None:
-                self.lm_head.weight.data.copy_(w.view(w.shape[0], w.shape[1], 1, 1))
+        
+        # Load lm_head weights with splitting support
+        state_dict: Dict[str, torch.Tensor] = {}
+        for file in os.listdir(model_path):
+            if file.endswith(".safetensors"):
+                state_dict.update(
+                    safetensors.torch.load_file(os.path.join(model_path, file))
+                )
+        
+        # Handle lm_head weight loading and splitting
+        lm_head_weight = None
+        for k, v in state_dict.items():
+            if k == "lm_head.weight":
+                lm_head_weight = v
+                break
+        
+        if lm_head_weight is not None:
+            if ENABLE_CONV2D:
+                reshaped_weight = lm_head_weight.view(lm_head_weight.shape[0], lm_head_weight.shape[1], 1, 1)
+                if ENABLE_VACAB_SPLIT16:
+                    vocab_split = self.config.vocab_size // 16
+                    vocab_remainder = self.config.vocab_size % 16
+                    # Create splits with proper sizes, distributing remainder among first splits
+                    split_sizes = [vocab_split + (1 if i < vocab_remainder else 0) for i in range(16)]
+                    splits = torch.split(reshaped_weight, split_sizes)
+                    for i, split in enumerate(splits):
+                        getattr(self, f"lm_head16_{i+1}").weight.data.copy_(split)
+                        print(f"Loaded lm_head16_{i+1}.weight with shape {split.shape}")
+                elif ENABLE_VACAB_SPLIT8:
+                    vocab_split = self.config.vocab_size // 8
+                    vocab_remainder = self.config.vocab_size % 8
+                    # Create splits with proper sizes, distributing remainder among first splits
+                    split_sizes = [vocab_split + (1 if i < vocab_remainder else 0) for i in range(8)]
+                    splits = torch.split(reshaped_weight, split_sizes)
+                    for i, split in enumerate(splits):
+                        getattr(self, f"lm_head8_{i+1}").weight.data.copy_(split)
+                        print(f"Loaded lm_head8_{i+1}.weight with shape {split.shape}")
+                elif ENABLE_VACAB_SPLIT:
+                    vocab_split = self.config.vocab_size // 2
+                    split1, split2 = torch.split(reshaped_weight, [vocab_split, self.config.vocab_size - vocab_split])
+                    self.lm_head2_1.weight.data.copy_(split1)
+                    self.lm_head2_2.weight.data.copy_(split2)
+                    print(f"Loaded lm_head2_1.weight and lm_head2_2.weight")
+                else:
+                    self.lm_head1.weight.data.copy_(reshaped_weight)
+                    print(f"Loaded lm_head1.weight")
+            else:
+                self.lm_head.weight.data.copy_(lm_head_weight.view(lm_head_weight.shape[0], lm_head_weight.shape[1], 1, 1))
+        else:
+            print("Warning: lm_head.weight not found in model weights")
+            return False
+        
         return True
