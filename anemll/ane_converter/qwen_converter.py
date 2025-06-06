@@ -76,14 +76,12 @@ class QwenConverter(BaseConverter):
                 position_ids: torch.Tensor,
                 causal_mask: torch.Tensor,
                 current_pos: torch.Tensor,
+                update_mask: torch.Tensor,
             ) -> torch.Tensor:
+                # Fixed window approach: return full logits, extract position on Python side
                 return self.model(
                     input_ids=input_ids,
-                    update_mask=torch.zeros(
-                        (1, 1, self.context_length, 1),
-                        dtype=MODEL_DTYPE,
-                        device=TEST_DEVICE,
-                    ),
+                    update_mask=update_mask,
                     position_ids=position_ids,
                     causal_mask=causal_mask,
                     current_pos=current_pos,
@@ -94,20 +92,19 @@ class QwenConverter(BaseConverter):
         wrapper.eval()
         print("Wrapper model created and set to eval mode")
 
-        seq_len = 4  # Sample sequence length for tracing
-        sample_input_ids = torch.zeros((1, seq_len), dtype=torch.int32, device=TEST_DEVICE)
-        sample_position_ids = torch.arange(seq_len, dtype=torch.int32, device=TEST_DEVICE)
-
-        
-        sample_causal_mask = torch.zeros(
-            (1, 1, seq_len, self.context_length), dtype=MODEL_DTYPE, device=TEST_DEVICE
-        )
-        sample_current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)
-        print("Sample inputs created")
+        print("Preparing model inputs for tracing...")
+        # Use fixed window approach - full context length with padding
+        sample_input_ids = torch.zeros((1, self.context_length), dtype=torch.int32, device=TEST_DEVICE)  # [1, context_length] - full window
+        sample_position_ids = torch.arange(self.context_length, dtype=torch.int32, device=TEST_DEVICE)  # [context_length] - [0, 1, 2, ..., 255]
+        sample_causal_mask = torch.zeros((1, 1, self.context_length, self.context_length), dtype=torch.float16, device=TEST_DEVICE)  # [1, 1, context_length, context_length]
+        sample_current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)  # [1] - position to extract logits from
+        sample_update_mask = torch.zeros((1, 1, self.context_length, 1), dtype=torch.float16, device=TEST_DEVICE)  # [1, 1, context_length, 1]
+        print("Sample inputs created (Fixed Window)")
         print(f"sample_input_ids shape: {sample_input_ids.shape}")
         print(f"sample_position_ids shape: {sample_position_ids.shape}")
         print(f"sample_causal_mask shape: {sample_causal_mask.shape}")
         print(f"sample_current_pos shape: {sample_current_pos.shape}")
+        print(f"sample_update_mask shape: {sample_update_mask.shape}")
 
         print("Starting torch.jit.trace...")
         traced = torch.jit.trace(
@@ -117,6 +114,7 @@ class QwenConverter(BaseConverter):
                 sample_position_ids,
                 sample_causal_mask,
                 sample_current_pos,
+                sample_update_mask,
             ),
         )
         print("torch.jit.trace completed!")
@@ -136,6 +134,9 @@ class QwenConverter(BaseConverter):
                 ),
                 ct.TensorType(
                     name="current_pos", shape=sample_current_pos.shape, dtype=np.int32
+                ),
+                ct.TensorType(
+                    name="update_mask", shape=sample_update_mask.shape, dtype=np.float16
                 ),
             ],
             outputs=[

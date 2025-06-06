@@ -83,7 +83,7 @@ class QwenConfig:
 
 
 class QwenRMSNorm(nn.Module):
-    """RMSNorm used in Qwen models."""
+    """RMSNorm used in Qwen models - Using true RMSNorm without mean subtraction."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -91,13 +91,21 @@ class QwenRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return F.layer_norm(
-            hidden_states, self.weight.shape, self.weight, eps=self.eps
-        ).to(MODEL_DTYPE)
+
+        mean = hidden_states.mean(-1, keepdim=True)
+        hidden_states = hidden_states - mean
+        return F.layer_norm(hidden_states, self.weight.shape, self.weight, bias=None, eps=float(self.eps)).to(TEST_DEVICE).to(MODEL_DTYPE)
+
+        
+        # Use true RMSNorm without mean subtraction (original Qwen implementation)
+        input_dtype = hidden_states.dtype
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        return (self.weight * hidden_states).to(MODEL_DTYPE)  # Ensure consistent output dtype
 
 
 class QwenHeadNorm(nn.Module):
-    """Per-head RMSNorm for query and key projections."""
+    """Per-head RMSNorm for query and key projections - Using true RMSNorm without mean subtraction."""
 
     def __init__(self, head_dim: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -105,9 +113,15 @@ class QwenHeadNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.layer_norm(x, (self.weight.shape[0],), self.weight, eps=self.eps).to(
-            MODEL_DTYPE
-        )
+        mean = x.mean(-1, keepdim=True)
+        x=x-mean
+        return F.layer_norm(x, self.weight.shape, self.weight, bias=None, eps=float(self.eps)).to(TEST_DEVICE).to(MODEL_DTYPE)
+
+
+        input_dtype = x.dtype
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        return (self.weight * x).to(MODEL_DTYPE)  # Ensure consistent output dtype
 
 
 class QwenRotaryEmbedding(nn.Module):
@@ -119,20 +133,36 @@ class QwenRotaryEmbedding(nn.Module):
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
         inv_freq = 1.0 / (
-            config.rope_theta ** (torch.arange(0, self.dim, 2).float() / self.dim)
+            config.rope_theta ** (torch.arange(0, self.dim, 2).float().to(TEST_DEVICE) / self.dim)
         )
+        #inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(TEST_DEVICE) / self.dim))
+
         self.register_buffer("inv_freq", inv_freq)
-        t = torch.arange(config.max_position_embeddings, dtype=inv_freq.dtype)
+        t = torch.arange(config.max_position_embeddings, device=TEST_DEVICE).type_as(self.inv_freq)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.cos_cached = emb.cos().unsqueeze(0)
         self.sin_cached = emb.sin().unsqueeze(0)
 
-    def forward(self, x: torch.Tensor, seq_len: int | None = None):
-        return (
-            self.cos_cached[:, : seq_len or x.shape[1]].to(x.dtype),
-            self.sin_cached[:, : seq_len or x.shape[1]].to(x.dtype),
-        )
+    def forward(self, x: torch.Tensor, position_ids: torch.LongTensor | None = None):
+        if position_ids is not None:
+            # Handle both 1D and 2D position_ids
+            if position_ids.dim() == 1:
+                pos_ids = position_ids
+            else:
+                pos_ids = position_ids.squeeze(0)  # Remove batch dimension if present
+            
+            # Use actual position IDs for correct rotary embeddings
+            cos = self.cos_cached[:, pos_ids].to(x.dtype)  # [1, seq_len, head_dim]
+            sin = self.sin_cached[:, pos_ids].to(x.dtype)  # [1, seq_len, head_dim]
+            return cos, sin
+        else:
+            # Fallback to sequential positions from 0
+            seq_len = x.shape[1]
+            return (
+                self.cos_cached[:, :seq_len].to(x.dtype),
+                self.sin_cached[:, :seq_len].to(x.dtype),
+            )
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -162,24 +192,29 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 class QwenMLP(nn.Module):
     def __init__(self, config: QwenConfig) -> None:
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Conv2d(
-            self.hidden_size, self.intermediate_size, 1, bias=False, dtype=MODEL_DTYPE
-        ).to(TEST_DEVICE)
-        self.up_proj = nn.Conv2d(
-            self.hidden_size, self.intermediate_size, 1, bias=False, dtype=MODEL_DTYPE
-        ).to(TEST_DEVICE)
-        self.down_proj = nn.Conv2d(
-            self.intermediate_size, self.hidden_size, 1, bias=False, dtype=MODEL_DTYPE
-        ).to(TEST_DEVICE)
+
+        # Use single Conv2d layers (no splitting for Qwen for now)
+        self.gate_proj = nn.Conv2d(self.hidden_size, self.intermediate_size, kernel_size=1, bias=False, dtype=MODEL_DTYPE)
+        self.up_proj = nn.Conv2d(self.hidden_size, self.intermediate_size, kernel_size=1, bias=False, dtype=MODEL_DTYPE)
+        self.down_proj = nn.Conv2d(self.intermediate_size, self.hidden_size, kernel_size=1, bias=False, dtype=MODEL_DTYPE)
+
         self.act_fn = F.silu
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hs = hidden_states.permute(0, 2, 1).unsqueeze(2)
-        gate = self.act_fn(self.gate_proj(hs)) * self.up_proj(hs)
-        hidden_states = self.down_proj(gate)
-        return hidden_states.squeeze(2).permute(0, 2, 1)
+    def forward(self, x):
+        # Use identical step-by-step computation to LlamaMLP to prevent numerical explosion
+        x = x.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)  # Ensure proper dtype and shape
+        
+        # Step-by-step computation for numerical stability (like LlamaMLP)
+        a = self.gate_proj(x)      # gate projection
+        b = self.up_proj(x)        # up projection
+        c = self.act_fn(a)         # activation on gate
+        d = c * b                  # multiply gate * up
+        e = self.down_proj(d)      # down projection
+        
+        return e.squeeze(2).permute(0, 2, 1)  # Final output shape: [bsz, seq_len, hidden_size]
 
 
 class QwenAttention(nn.Module):
@@ -255,7 +290,7 @@ class QwenAttention(nn.Module):
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
 
-        cos, sin = self.rotary_emb(hidden_states, seq_len)
+        cos, sin = self.rotary_emb(hidden_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin
         )
@@ -446,6 +481,17 @@ class QwenForCausalLM(nn.Module):
             current_pos,
             IN_PREFILL=IN_PREFILL,
         )
+        
+        # Extract hidden states at current position right before LM head (using current_pos dynamically)
+        if not IN_PREFILL and current_pos is not None:
+            # Use torch.index_select for dynamic position extraction that traces well
+            if isinstance(current_pos, torch.Tensor):
+                pos_tensor = current_pos if current_pos.dim() > 0 else current_pos.unsqueeze(0)
+            else:
+                pos_tensor = torch.tensor([current_pos], device=hidden_states.device, dtype=torch.long)
+            
+            # Use index_select which should create proper dynamic slicing in CoreML using current_pos
+            hidden_states = torch.index_select(hidden_states, dim=1, index=pos_tensor)  # [batch, 1, hidden_size]
         
         # Project to vocabulary using appropriate head
         if ENABLE_CONV2D:
