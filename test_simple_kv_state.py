@@ -128,11 +128,11 @@ def test_kv_cache_state_management():
         if i == len(input_ids) - 1:  # Last token - this is our first generation
             generated_tokens.append(next_token)
     
-    # Continue generating a few more tokens
-    print(f"\n🚀 Generating additional tokens...")
+    # Continue generating 31 tokens
+    print(f"\n🚀 Generating 31 additional tokens...")
     current_pos = len(input_ids)
     
-    for gen_step in range(5):  # Generate 5 more tokens
+    for gen_step in range(31):  # Generate 31 tokens
         print(f"\nGeneration step {gen_step + 1}:")
         
         # Use the last generated token as input
