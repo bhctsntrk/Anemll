@@ -5,7 +5,6 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import sys
 import os
-import glob
 import json
 
 # Add the anemll directory to Python path
@@ -19,18 +18,17 @@ def test_sequential_token_processing():
     print("🔄 Testing Sequential Token Processing (No KV Cache)")
     print("=" * 70)
     
-    # Find model path
-    model_path = "~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/"
-    model_dirs = glob.glob(os.path.expanduser(model_path + "*"))
-    if not model_dirs:
-        print("❌ Error: Qwen model not found in cache")
-        return False
-    
-    model_dir = model_dirs[0]
-    print(f"Using model from: {model_dir}")
+    # Use Hugging Face model identifier
+    model_id = "Qwen/Qwen3-0.6B"
+    print(f"Using Hugging Face model: {model_id}")
     
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False, trust_remote_code=True)
+    
+    # Download model files using huggingface_hub
+    from huggingface_hub import snapshot_download
+    cached_dir = snapshot_download(model_id, allow_patterns=["config.json", "*.safetensors"])
+    print(f"Model cached at: {cached_dir}")
     
     # Test prompt
     prompt = "What is Apple Neural Engine?"
@@ -46,19 +44,20 @@ def test_sequential_token_processing():
     # Load original Transformers model for reference
     print(f"\n📚 Loading Original Transformers Model...")
     original_model = AutoModelForCausalLM.from_pretrained(
-        model_dir, 
-        torch_dtype=torch.float16
+        model_id, 
+        torch_dtype=torch.float16,
+        trust_remote_code=True
     )
     
     # Load our PyTorch model
     print(f"\n🔧 Loading Our PyTorch Model...")
-    config_path = os.path.join(model_dir, "config.json")
+    config_path = os.path.join(cached_dir, "config.json")
     with open(config_path, 'r') as f:
         config_dict = json.load(f)
     
     config = QwenConfig(**config_dict)
     our_model = QwenForCausalLM(config, enable_coreml=False, disable_kv_cache=True)
-    our_model.load_pretrained_weights(model_dir)
+    our_model.load_pretrained_weights(str(cached_dir))
     our_model.eval()
     
     # Test original model (for reference)
