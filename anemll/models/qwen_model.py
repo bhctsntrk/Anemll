@@ -25,7 +25,13 @@ import torch.nn.functional as F
 
 MODEL_DTYPE = torch.float16
 TEST_DEVICE = "cpu"
-CONTEXT_LENGTH = 512
+CONTEXT_LENGTH = 256
+
+# Cache configuration constants (following llama_model.py pattern)
+FORCE_UNIFIED_CACHE = True  # Force using a single unified KV cache
+ENABLE_UNIFIED_CACHE = True  # Enable unified KV cache by default
+STATE_LENGTH = 256   # KV cache state length
+DISABLE_KV_CACHE = False  # Disable KV cache for simple testing
 
 # LM head configuration constants (following llama_model.py pattern)
 ENABLE_CONV2D = bool(1)      # Use Conv2d for LM head
@@ -56,6 +62,8 @@ class QwenConfig:
             "head_dim",
             self.hidden_size // max(1, self.num_attention_heads),
         )
+        # Note: For Qwen, head_dim may not equal hidden_size // num_attention_heads
+        # The model architecture uses a different relationship
         self.pretraining_tp = kwargs.get("pretraining_tp", 1)
         self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-05)
         self.rope_scaling = kwargs.get("rope_scaling", None)
@@ -68,13 +76,21 @@ class QwenConfig:
         self.use_cache = kwargs.get("use_cache", True)
         self.vocab_size = kwargs.get("vocab_size", 128257)
         self.context_length = kwargs.get("context_length", CONTEXT_LENGTH)
-        self.state_length = kwargs.get("state_length", CONTEXT_LENGTH)
+        self.state_length = kwargs.get("state_length", STATE_LENGTH)
 
     @classmethod
     def from_json(cls, json_file):
         with open(json_file, "r") as f:
             config_dict = json.load(f)
         return cls(**config_dict)
+
+
+def get_kv_cache_idx(layer_idx, num_layers, num_groups=1):
+    """Helper function to get KV cache indices."""
+    layers_per_group = num_layers // num_groups
+    group_idx = layer_idx // layers_per_group
+    layer_in_group_idx = layer_idx % layers_per_group
+    return group_idx, layer_in_group_idx, layers_per_group
 
 
 # -----------------------------------------------------------------------------
@@ -91,17 +107,10 @@ class QwenRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-
+        # Following ANEMLL requirements: always subtract mean first, then use F.layer_norm()
         mean = hidden_states.mean(-1, keepdim=True)
         hidden_states = hidden_states - mean
         return F.layer_norm(hidden_states, self.weight.shape, self.weight, bias=None, eps=float(self.eps)).to(TEST_DEVICE).to(MODEL_DTYPE)
-
-        
-        # Use true RMSNorm without mean subtraction (original Qwen implementation)
-        input_dtype = hidden_states.dtype
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-        return (self.weight * hidden_states).to(MODEL_DTYPE)  # Ensure consistent output dtype
 
 
 class QwenHeadNorm(nn.Module):
@@ -113,15 +122,10 @@ class QwenHeadNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Following ANEMLL requirements: always subtract mean first, then use F.layer_norm()
         mean = x.mean(-1, keepdim=True)
-        x=x-mean
+        x = x - mean
         return F.layer_norm(x, self.weight.shape, self.weight, bias=None, eps=float(self.eps)).to(TEST_DEVICE).to(MODEL_DTYPE)
-
-
-        input_dtype = x.dtype
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return (self.weight * x).to(MODEL_DTYPE)  # Ensure consistent output dtype
 
 
 class QwenRotaryEmbedding(nn.Module):
@@ -181,6 +185,26 @@ def apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
+def apply_rotary_pos_emb_prefill(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # For prefill, cos/sin already have the correct shape [1, 1, seq_len, head_dim]
+    # No need to unsqueeze - just apply directly
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def apply_rotary_pos_emb_single(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # For single token generation, cos/sin already have shape [1, 1, 1, head_dim]
+    # No need to unsqueeze - just apply directly 
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
         return hidden_states
@@ -220,35 +244,45 @@ class QwenMLP(nn.Module):
 class QwenAttention(nn.Module):
     def __init__(self, config: QwenConfig) -> None:
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
+        if not hasattr(QwenAttention, '_config_printed'):
+            print(f"QwenAttention using head_dim={self.head_dim} (from config: {getattr(config, 'head_dim', 'not set')})")
+            print(f"QwenAttention projection dims: Q={self.num_heads * self.head_dim}, K/V={self.num_kv_heads * self.head_dim}")
+            QwenAttention._config_printed = True
+            
         self.rotary_emb = QwenRotaryEmbedding(config)
 
+        # Calculate correct projection dimensions
+        q_proj_dim = self.num_heads * self.head_dim  # 16 * 128 = 2048
+        kv_proj_dim = self.num_kv_heads * self.head_dim  # 8 * 128 = 1024
+        
         self.q_proj = nn.Conv2d(
             self.hidden_size,
-            self.num_heads * self.head_dim,
+            q_proj_dim,
             1,
             bias=False,
             dtype=MODEL_DTYPE,
         ).to(TEST_DEVICE)
         self.k_proj = nn.Conv2d(
             self.hidden_size,
-            self.num_kv_heads * self.head_dim,
+            kv_proj_dim,
             1,
             bias=False,
             dtype=MODEL_DTYPE,
         ).to(TEST_DEVICE)
         self.v_proj = nn.Conv2d(
             self.hidden_size,
-            self.num_kv_heads * self.head_dim,
+            kv_proj_dim,
             1,
             bias=False,
             dtype=MODEL_DTYPE,
         ).to(TEST_DEVICE)
         self.o_proj = nn.Conv2d(
-            self.num_heads * self.head_dim,
+            q_proj_dim,
             self.hidden_size,
             1,
             bias=False,
@@ -257,6 +291,64 @@ class QwenAttention(nn.Module):
         self.q_norm = QwenHeadNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = QwenHeadNorm(self.head_dim, eps=config.rms_norm_eps)
         self.scale = 1 / math.sqrt(self.head_dim)
+
+    def repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """
+        Repeat key/value heads n_rep times, while keeping the batch dimension intact.
+        Input shape: (num_key_value_heads, seqlen, head_dim)
+        Output shape: (batch=1, num_attention_heads, seqlen, head_dim)
+        """
+        x = x.unsqueeze(1)  # Shape: (num_kv_heads, 1, seq_len, head_dim)
+        x = x.repeat(1, n_rep, 1, 1)  # Shape: (num_kv_heads, n_rep, seq_len, head_dim)
+        x = x.view(1, -1, x.size(-2), x.size(-1))  # Shape: (1, num_kv_heads * n_rep, seq_len, head_dim)
+        return x
+
+    def get_new_kv_cache(self, hidden_states, current_pos, rotary_emb):
+        """Get new key-value cache entries for single token generation."""
+        bsz, q_len, _ = hidden_states.shape
+        device = hidden_states.device
+        
+        # Project QKV and ensure MODEL_DTYPE
+        hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2).to(MODEL_DTYPE)
+        
+        # Perform projections with fixed dimensions
+        query_states = self.q_proj(hidden_states).view(1, self.num_heads, 1, self.head_dim).to(MODEL_DTYPE)
+        key_states = self.k_proj(hidden_states).view(1, self.num_kv_heads, 1, self.head_dim).to(MODEL_DTYPE)
+        value_states = self.v_proj(hidden_states).view(1, self.num_kv_heads, 1, self.head_dim).to(MODEL_DTYPE)
+        
+        # Use provided rotary embeddings (single token version)
+        cos, sin = rotary_emb
+        query_states, key_states = apply_rotary_pos_emb_single(query_states, key_states, cos, sin)
+        
+        return query_states, key_states, value_states
+
+    def get_new_kv_cache_prefill(self, hidden_states, current_pos, rotary_emb):
+        """Get new key-value cache entries optimized for prefilling with batched tokens."""
+        bsz, seq_len, _ = hidden_states.shape # [1, seq_len, hidden_size]
+        device = hidden_states.device
+        
+        # Project QKV and ensure MODEL_DTYPE - optimized for batch processing
+        hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2).to(MODEL_DTYPE)  # [1, hidden_size, 1, seq_len]
+
+        # Project all tokens at once using Conv2d
+        query_states = self.q_proj(hidden_states)  # [1, num_heads * head_dim, 1, seq_len]
+        key_states = self.k_proj(hidden_states)    # [1, num_kv_heads * head_dim, 1, seq_len]
+        value_states = self.v_proj(hidden_states)  # [1, num_kv_heads * head_dim, 1, seq_len]
+
+        # Reshape to final dimensions
+        query_states = query_states.view(1, self.num_heads, self.head_dim, seq_len).permute(0, 1, 3, 2)  # [1, num_heads, seq_len, head_dim]
+        key_states = key_states.view(1, self.num_kv_heads, self.head_dim, seq_len).permute(0, 1, 3, 2)  # [1, num_kv_heads, seq_len, head_dim]
+        value_states = value_states.view(1, self.num_kv_heads, self.head_dim, seq_len).permute(0, 1, 3, 2)  # [1, num_kv_heads, seq_len, head_dim]
+
+        # Get rotary embeddings for all positions at once
+        cos, sin = rotary_emb
+        cos = cos.permute(0, 2, 1, 3)  # [1, 1, seq_len, head_dim]
+        sin = sin.permute(0, 2, 1, 3)  # [1, 1, seq_len, head_dim]
+
+        # Apply rotary embeddings to all positions at once (cos/sin already have correct dims for prefill)
+        query_states, key_states = apply_rotary_pos_emb_prefill(query_states, key_states, cos, sin)
+
+        return query_states.to(MODEL_DTYPE), key_states.to(MODEL_DTYPE), value_states.to(MODEL_DTYPE)
 
     def forward(
         self,
@@ -310,6 +402,85 @@ class QwenAttention(nn.Module):
         out = self.o_proj(attn_output.permute(0, 2, 1).unsqueeze(2))
         return out.squeeze(2).permute(0, 2, 1)
 
+    def forward_regular(self, hidden_states, query_states, kv_cache_layer=None, causal_mask=None, current_pos=None):
+        """Forward pass for single token generation."""
+        bsz, q_len, _ = hidden_states.shape
+                
+        # Get KV cache
+        K_layer_cache, V_layer_cache = kv_cache_layer
+        
+        # For CoreML compatibility, use fixed cache length (STATE_LENGTH)
+        # This ensures consistent tensor shapes for optimization
+        K_layer_cache = K_layer_cache[..., :self.config.state_length, :]
+        V_layer_cache = V_layer_cache[..., :self.config.state_length, :]
+        
+        # Repeat KV for multi-head attention
+        n_rep = self.num_heads // self.num_kv_heads
+        key_states = self.repeat_kv(K_layer_cache, n_rep)
+        value_states = self.repeat_kv(V_layer_cache, n_rep)
+
+        # Compute attention using optimized path for batch_size=1
+        attn_weights = torch.matmul(query_states.to(MODEL_DTYPE), key_states.transpose(-1, -2).to(MODEL_DTYPE)) * self.scale
+        
+        if causal_mask is not None:
+            # Match the causal mask to the actual dimensions being used
+            q_seq_len = query_states.shape[-2]  # Query sequence length (usually 1 for single token)
+            k_seq_len = key_states.shape[-2]   # Key sequence length (cache length)
+            attn_weights = attn_weights + causal_mask.to(MODEL_DTYPE)[:, :, :q_seq_len, :k_seq_len]
+        
+        # Optimized softmax for batch_size=1
+        attn_weights = torch.softmax(attn_weights, dim=-1)
+        
+        # Compute attention output directly without einsum
+        attn_output = torch.matmul(attn_weights, value_states.to(MODEL_DTYPE))
+        
+        # Reshape before projecting: [1, heads, q_len, head_dim] -> [1, q_len, heads*head_dim]
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+        
+        # Project output (this will reshape from num_heads*head_dim back to hidden_size)
+        attn_output = self.o_proj(attn_output.permute(0, 2, 1).unsqueeze(2))
+        return attn_output.squeeze(2).permute(0, 2, 1)
+
+    def forward_prefill(self, hidden_states, query_states, kv_cache_layer=None, causal_mask=None):
+        """Forward pass for prefill mode"""
+        bsz, q_len, _ = hidden_states.shape
+                
+        # Get KV cache
+        K_layer_cache, V_layer_cache = kv_cache_layer
+        
+        # For CoreML compatibility, use fixed cache length (STATE_LENGTH) 
+        K_layer_cache = K_layer_cache[..., :self.config.state_length, :]
+        V_layer_cache = V_layer_cache[..., :self.config.state_length, :]
+        
+        # Repeat KV for multi-head attention
+        n_rep = self.num_heads // self.num_kv_heads
+        key_states = self.repeat_kv(K_layer_cache, n_rep)
+        value_states = self.repeat_kv(V_layer_cache, n_rep)
+        
+        # Compute scaled dot-product attention
+        attn_weights = torch.einsum('bhqd,bhkd->bhqk', query_states.to(MODEL_DTYPE), key_states.to(MODEL_DTYPE)) * self.scale
+        
+        if causal_mask is not None:
+            # Slice causal mask to match actual query and key sequence lengths
+            q_seq_len = query_states.shape[2]  # Query sequence length
+            k_seq_len = min(key_states.shape[2], self.config.context_length)  # Key sequence length
+            mask_slice = causal_mask.to(MODEL_DTYPE)[:, :, :q_seq_len, :k_seq_len]
+            attn_weights = attn_weights + mask_slice
+        
+        attn_weights = torch.softmax(attn_weights, dim=-1)
+        attn_output = torch.einsum('bhqk,bhkd->bhqd', attn_weights, value_states.to(MODEL_DTYPE))
+        
+        # Reshape before projecting: [batch, heads, actual_seq_len, head_dim] -> [batch, actual_seq_len, heads*head_dim]
+        # Use actual tensor dimensions instead of input q_len
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        actual_bsz, actual_seq_len, num_heads, head_dim = attn_output.shape
+        attn_output = attn_output.reshape(actual_bsz, actual_seq_len, num_heads * head_dim)
+        
+        # Project output (this will reshape from num_heads*head_dim back to hidden_size)
+        attn_output = self.o_proj(attn_output.permute(0, 2, 1).unsqueeze(2))
+        return attn_output.squeeze(2).permute(0, 2, 1)
+
 
 class QwenDecoderLayer(nn.Module):
     def __init__(self, config: QwenConfig) -> None:
@@ -354,6 +525,191 @@ class QwenModel(nn.Module):
         )
         self.norm = QwenRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # Initialize KV cache with MODEL_DTYPE (following llama_model.py pattern)  
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        if not hasattr(QwenModel, '_config_printed'):
+            print(f"QwenModel using head_dim={self.head_dim} for KV cache (config has: {getattr(config, 'head_dim', 'not set')})")
+            QwenModel._config_printed = True
+        
+        if FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE:
+            cache_size = (
+                2 * config.num_hidden_layers,
+                config.num_key_value_heads,
+                config.state_length,
+                self.head_dim
+            )
+            self.register_buffer("kv_cache_0", torch.zeros(cache_size, dtype=MODEL_DTYPE, device=TEST_DEVICE))
+            if not hasattr(QwenModel, '_cache_init_printed'):
+                print(f"Initialized unified KV kv_cache_0 with shape: {self.kv_cache_0.shape}")
+                QwenModel._cache_init_printed = True
+        else:
+            layers_per_group = config.num_hidden_layers
+            for i in range(config.num_hidden_layers):
+                cache_size = (
+                    2 * layers_per_group,
+                    config.num_key_value_heads,
+                    config.state_length,
+                    self.head_dim
+                )
+                self.register_buffer(
+                    f"kv_cache_{i}", 
+                    torch.zeros(cache_size, dtype=MODEL_DTYPE, device=TEST_DEVICE)
+                )
+
+    def get_rotary_embeddings_s(self, current_pos):
+        """Get rotary embeddings for the current position"""
+        sin = self.layers[0].self_attn.rotary_emb.sin_cached[:, current_pos].view(1, 1, 1, -1)
+        cos = self.layers[0].self_attn.rotary_emb.cos_cached[:, current_pos].view(1, 1, 1, -1)
+        return cos.to(MODEL_DTYPE), sin.to(MODEL_DTYPE)
+
+    def get_rotary_embedding_prefill(self, positions):
+        """Get rotary embeddings for a sequence of positions.
+        Args:
+            positions: Tensor of position indices
+        Returns:
+            Tuple of (cos, sin) tensors with shape [1, seq_len, 1, head_dim]
+        """
+        # Get rotary embeddings from the first attention layer
+        rotary_emb = self.layers[0].self_attn.rotary_emb
+        
+        # Get embeddings for the range of positions directly
+        seq_len = positions.size(0)
+        cos = rotary_emb.cos_cached[:, positions].view(1, seq_len, 1, rotary_emb.dim)
+        sin = rotary_emb.sin_cached[:, positions].view(1, seq_len, 1, rotary_emb.dim)
+        
+        return cos.to(MODEL_DTYPE), sin.to(MODEL_DTYPE)
+
+    def process_layer_prefill(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, rotary_emb, layer_offset):
+        """Process a single transformer layer in prefill mode"""
+        layer = self.layers[layer_idx]
+
+        normalized_states = layer.input_layernorm(hidden_states)
+        
+        # Get query, key and value states for prefill
+        query_states, key_states, value_states = layer.self_attn.get_new_kv_cache_prefill(
+            normalized_states,
+            current_pos,
+            rotary_emb
+        )
+
+        # Get group indices
+        group_idx, layer_in_group_idx, layers_per_group = get_kv_cache_idx(layer_idx, self.config.num_hidden_layers)
+
+        # Get the combined KV cache for this group
+        if FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE:
+            kv_cache = getattr(self, "kv_cache_0")
+        else:
+            kv_cache = getattr(self, f"kv_cache_{group_idx}")
+
+        key_idx = layer_in_group_idx
+        value_idx = layer_in_group_idx + layers_per_group
+
+        # Store the full sequence length in prefill mode
+        seq_length = key_states.shape[2]  # Get actual sequence length
+        kv_cache[key_idx:key_idx + 1, :, current_pos:current_pos + seq_length, :] = key_states
+        kv_cache[value_idx:value_idx + 1, :, current_pos:current_pos + seq_length, :] = value_states
+        
+        # Get the key and value states for this layer from the merged cache
+        key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
+        value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
+
+        # Run attention with the updated KV cache
+        attn_output = layer.self_attn.forward_prefill(
+            hidden_states=normalized_states,
+            query_states=query_states,
+            kv_cache_layer=(key_cache, value_cache),
+            causal_mask=causal_mask,
+        )
+
+        hidden_states = hidden_states + attn_output
+
+        # Always apply MLP in prefill mode when we need the output for generation
+        # Only skip MLP when doing pure cache priming (not generation)
+        post_attn = layer.post_attention_layernorm(hidden_states)
+        hidden_states = hidden_states + layer.mlp(post_attn)
+
+        return hidden_states
+
+    def process_layer_regular(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, rotary_emb, layer_offset):
+        """Process a single transformer layer in regular (non-prefill) mode"""
+        layer = self.layers[layer_idx]
+        batch_size = position_ids.shape[0]
+
+        normalized_states = layer.input_layernorm(hidden_states)
+        
+        # Get query, key and value states for regular processing
+        query_states, key_states, value_states = layer.self_attn.get_new_kv_cache(
+            normalized_states,
+            current_pos,
+            rotary_emb
+        )
+
+        # Get group indices
+        group_idx, layer_in_group_idx, layers_per_group = get_kv_cache_idx(layer_idx, self.config.num_hidden_layers)
+
+        # Get the combined KV cache for this group
+        if FORCE_UNIFIED_CACHE or ENABLE_UNIFIED_CACHE:
+            kv_cache = getattr(self, "kv_cache_0")
+        else:
+            kv_cache = getattr(self, f"kv_cache_{group_idx}")
+
+        key_idx = layer_in_group_idx
+        value_idx = layer_in_group_idx + layers_per_group
+
+        # CRITICAL FIX: Store current K/V in cache BEFORE getting cache for attention
+        # Ensure proper tensor assignment with explicit indexing
+        if isinstance(current_pos, torch.Tensor):
+            pos = current_pos.item()
+        else:
+            pos = current_pos
+            
+        kv_cache[key_idx, :, pos, :] = key_states.squeeze(0).squeeze(1)  # Remove batch and seq dims
+        kv_cache[value_idx, :, pos, :] = value_states.squeeze(0).squeeze(1)  # Remove batch and seq dims
+        
+        # Get the key and value states for this layer from the merged cache
+        key_cache = kv_cache[key_idx:key_idx + 1].squeeze(0)
+        value_cache = kv_cache[value_idx:value_idx + 1].squeeze(0)
+
+        # Run attention with the updated KV cache
+        attn_output = layer.self_attn.forward_regular(
+            hidden_states=normalized_states,
+            query_states=query_states,
+            kv_cache_layer=(key_cache, value_cache),
+            causal_mask=causal_mask,
+            current_pos=current_pos,
+        )
+
+        hidden_states = hidden_states + attn_output
+
+        # Add post-attention normalization and MLP
+        post_attn = layer.post_attention_layernorm(hidden_states)
+        hidden_states = hidden_states + layer.mlp(post_attn)
+
+        return hidden_states
+
+    def process_layer(self, layer_idx, hidden_states, position_ids, causal_mask, current_pos, rotary_emb, layer_offset, IN_PREFILL=False):
+        """Process a single transformer layer, delegating to the appropriate mode-specific implementation"""
+        if IN_PREFILL:
+           return self.process_layer_prefill(layer_idx, hidden_states, position_ids, causal_mask, current_pos, rotary_emb, layer_offset)
+        else:
+            return self.process_layer_regular(layer_idx, hidden_states, position_ids, causal_mask, current_pos, rotary_emb, layer_offset)
+
+    def process_layers(self, hidden_states, position_ids, causal_mask, current_pos, rotary_emb, start_layer=0, end_layer=None, IN_PREFILL=False):
+        """Process a range of transformer layers"""
+        if end_layer is None:
+            end_layer = len(self.layers)
+
+        layer_offset = 0
+        if not ENABLE_UNIFIED_CACHE:
+            layer_offset = start_layer
+
+        for i in range(start_layer, end_layer):
+            hidden_states = self.process_layer(
+                i, hidden_states, position_ids,
+                causal_mask, current_pos, rotary_emb, layer_offset, IN_PREFILL
+            )
+        return hidden_states
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -362,14 +718,62 @@ class QwenModel(nn.Module):
         current_pos: torch.LongTensor,
         IN_PREFILL: bool = False,
     ) -> torch.Tensor:
-        """Forward pass through the transformer layers."""
+        """Forward pass through the transformer layers with KV cache support."""
         hidden_states = self.embed_tokens(input_ids)
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, causal_mask, position_ids, current_pos)
+        
+        # Get rotary embeddings
         if IN_PREFILL:
-            # Skip final normalization when used only for cache priming
-            return hidden_states
+            rotary_emb = self.get_rotary_embedding_prefill(position_ids)
+        else:
+            rotary_emb = self.get_rotary_embeddings_s(current_pos)
+
+        # Process layers
+        hidden_states = self.process_layers(
+            hidden_states, position_ids, causal_mask,
+            current_pos, rotary_emb, start_layer=0, end_layer=None, IN_PREFILL=IN_PREFILL,
+        )
+
+        # Always apply final normalization - critical for correct model output
         hidden_states = self.norm(hidden_states)
+
+        return hidden_states
+
+    def forward_prefill(self, hidden_states, position_ids=None, causal_mask=None, current_pos=None, start_layer=None, end_layer=None):
+        """
+        Forward pass for prefilling KV cache
+        """
+        batch_size, seq_length, _ = hidden_states.size()
+        
+        # Get rotary embeddings
+        rotary_emb = self.get_rotary_embedding_prefill(position_ids)
+        
+        # Process layers within the specified range if provided
+        if start_layer is not None and end_layer is not None:
+            hidden_states = self.process_layers(
+                hidden_states=hidden_states,
+                position_ids=position_ids,
+                causal_mask=causal_mask,
+                current_pos=current_pos,
+                rotary_emb=rotary_emb,
+                start_layer=start_layer,
+                end_layer=end_layer,
+                IN_PREFILL=True
+            )
+        else:
+            # Process all layers for non-split mode
+            hidden_states = self.process_layers(
+                hidden_states=hidden_states,
+                position_ids=position_ids,
+                causal_mask=causal_mask,
+                current_pos=current_pos,
+                rotary_emb=rotary_emb,
+                IN_PREFILL=True
+            )
+        
+        # Apply final normalization if this is the last block
+        if end_layer is None or end_layer == len(self.layers):
+            hidden_states = self.norm(hidden_states)
+
         return hidden_states
 
     # ------------------------------------------------------------------
@@ -408,6 +812,9 @@ class QwenModel(nn.Module):
 
         missing, unexpected = self.load_state_dict(conv_state, strict=False)
         missing = [m for m in missing if "rotary_emb.inv_freq" not in m]
+        # Filter out expected missing keys including KV cache buffer
+        expected_missing = ['kv_cache_0']  # KV cache buffer is initialized separately
+        missing = [m for m in missing if m not in expected_missing]
         if missing or unexpected:
             print("Missing keys", missing)
             print("Unexpected keys", unexpected)
@@ -417,10 +824,11 @@ class QwenModel(nn.Module):
 class QwenForCausalLM(nn.Module):
     config_class = QwenConfig
 
-    def __init__(self, config: QwenConfig, enable_coreml=False, **kwargs) -> None:
+    def __init__(self, config: QwenConfig, enable_coreml=False, disable_kv_cache=False, **kwargs) -> None:
         super().__init__()
         self.config = config
         self.enable_coreml = enable_coreml
+        self.disable_kv_cache = disable_kv_cache or DISABLE_KV_CACHE
         self.model = QwenModel(config)
         
         # Initialize lm_head as Conv2d for ANE optimization following llama_model.py pattern
@@ -433,7 +841,9 @@ class QwenForCausalLM(nn.Module):
                     split_size = vocab_split + (1 if i < vocab_remainder else 0)
                     setattr(self, f"lm_head16_{i+1}", 
                            nn.Conv2d(config.hidden_size, split_size, 1, bias=False, dtype=MODEL_DTYPE).to(TEST_DEVICE))
-                print("Created lm_head16_1 through lm_head16_16")
+                if not hasattr(QwenForCausalLM, '_lm_head_printed'):
+                    print("Created lm_head16_1 through lm_head16_16")
+                    QwenForCausalLM._lm_head_printed = True
             elif ENABLE_VACAB_SPLIT8:
                 vocab_split = config.vocab_size // 8
                 vocab_remainder = config.vocab_size % 8
@@ -474,23 +884,45 @@ class QwenForCausalLM(nn.Module):
                 position_ids.shape[-1] == input_ids.shape[-1]
             ), "position_ids length must match input_ids in prefill"
 
-        hidden_states = self.model(
-            input_ids,
-            causal_mask,
-            position_ids,
-            current_pos,
-            IN_PREFILL=IN_PREFILL,
-        )
-        
-        # Extract hidden states at current position right before LM head (using current_pos dynamically)
-        if not IN_PREFILL and current_pos is not None:
-            # Use torch.index_select for dynamic position extraction that traces well
-            if isinstance(current_pos, torch.Tensor):
-                pos_tensor = current_pos if current_pos.dim() > 0 else current_pos.unsqueeze(0)
-            else:
-                pos_tensor = torch.tensor([current_pos], device=hidden_states.device, dtype=torch.long)
+        if self.disable_kv_cache:
+            # Simple forward path without KV cache
+            hidden_states = self.model.embed_tokens(input_ids)
             
-            # Use index_select which should create proper dynamic slicing in CoreML using current_pos
+            for layer in self.model.layers:
+                hidden_states = layer(
+                    hidden_states,
+                    causal_mask,
+                    position_ids,
+                    current_pos,
+                )
+            
+            hidden_states = self.model.norm(hidden_states)
+        else:
+            # Standard KV cache path
+            hidden_states = self.model(
+                input_ids,
+                causal_mask,
+                position_ids,
+                current_pos,
+                IN_PREFILL=IN_PREFILL,
+            )
+        
+        # Extract hidden states at current position right before LM head
+        if not IN_PREFILL and current_pos is not None:
+            # For single token generation, extract the last (and only) position from hidden_states
+            # hidden_states has shape [batch, 1, hidden_size] for single token generation
+            seq_len = hidden_states.shape[1]
+            if seq_len == 1:
+                # Single token case - use position 0 (the only position available)
+                pos_tensor = torch.tensor([0], device=hidden_states.device, dtype=torch.long)
+            else:
+                # Multi-token case - use the actual current_pos (for compatibility)
+                if isinstance(current_pos, torch.Tensor):
+                    pos_tensor = current_pos if current_pos.dim() > 0 else current_pos.unsqueeze(0)
+                else:
+                    pos_tensor = torch.tensor([current_pos], device=hidden_states.device, dtype=torch.long)
+            
+            # Use index_select for position extraction
             hidden_states = torch.index_select(hidden_states, dim=1, index=pos_tensor)  # [batch, 1, hidden_size]
         
         # Project to vocabulary using appropriate head
@@ -558,24 +990,40 @@ class QwenForCausalLM(nn.Module):
         
         return logits
 
-    def prefill_kv_cache(
-        self,
-        input_ids: torch.LongTensor,
-        position_ids: torch.LongTensor,
-        start_pos: torch.LongTensor,
-        causal_mask: torch.Tensor,
-    ) -> None:
-        seq_len = input_ids.shape[1]
-        causal_slice = (
-            causal_mask[:, :, :seq_len, :] if causal_mask is not None else None
-        )
+    def prefill_kv_cache(self, input_ids, position_ids, start_pos, causal_mask):
+        """
+        Pre-fills KV cache for a batch of tokens starting from start_pos.
+        
+        Args:
+            input_ids: Input token IDs of shape [batch_size, seq_length]
+            position_ids: Position IDs for the sequence
+            start_pos: Starting position in the KV cache
+            causal_mask: Causal attention mask
+            
+        Returns:
+            None (updates KV cache in-place)
+        """
+        batch_size, seq_length = input_ids.shape
+        
+        # Get embeddings and run through model
+        hidden_states = self.model.embed_tokens(input_ids)
+        hidden_states = hidden_states.to(MODEL_DTYPE)
+
+        # Get correct causal mask for the sequence
+        # For prefill, each token should attend to all previous tokens in the sequence
+        if causal_mask is not None:
+            # Take the full sequence slice of causal mask
+            causal_mask_prefill = causal_mask[:, :, :seq_length, :]
+        else:
+            causal_mask_prefill = None
+        
+        # Process through model to update KV cache
         with torch.no_grad():
-            self.model(
-                input_ids,
-                causal_slice,
-                position_ids,
-                start_pos,
-                IN_PREFILL=True,
+            self.model.forward_prefill(
+                hidden_states=hidden_states,
+                position_ids=position_ids,
+                causal_mask=causal_mask_prefill,
+                current_pos=start_pos
             )
 
     def load_pretrained_weights(self, model_path: str) -> bool:
