@@ -78,12 +78,13 @@ def test_kv_cache_state_management():
     
     # Find model path
     model_path = "~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/"
-    model_dirs = glob.glob(os.path.expanduser(model_path + "*"))
+    model_dirs = glob.glob(os.path.expanduser(model_path + "*") )
     if not model_dirs:
-        print("❌ Error: Qwen model not found in cache")
-        return False
-    
-    model_dir = model_dirs[0]
+        from huggingface_hub import snapshot_download
+        print("Model not found in cache, downloading from HuggingFace...")
+        model_dir = snapshot_download("Qwen/Qwen3-0.6B")
+    else:
+        model_dir = model_dirs[0]
     print(f"Using model from: {model_dir}")
     
     # Load tokenizer and config

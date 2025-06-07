@@ -376,8 +376,8 @@ class QwenAttention(nn.Module):
         )
 
         n_rep = self.num_heads // self.num_kv_heads
-        key_states = repeat_kv(key_states, n_rep)
-        value_states = repeat_kv(value_states, n_rep)
+        key_states = self.repeat_kv(key_states.squeeze(0), n_rep)
+        value_states = self.repeat_kv(value_states.squeeze(0), n_rep)
 
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
