@@ -6,7 +6,6 @@ import torch
 import numpy as np
 import argparse
 import os
-import glob
 from pathlib import Path
 import coremltools as ct
 from transformers import AutoTokenizer
@@ -162,8 +161,8 @@ def test_coreml_kv_cache_sequential():
                        default='/tmp/qwen-test/float32/test_qwen.mlpackage',
                        help='Path to CoreML model file')
     parser.add_argument('--tokenizer', type=str, 
-                       default='~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/',
-                       help='Tokenizer path for Qwen')
+                       default='Qwen/Qwen3-0.6B',
+                       help='Hugging Face model identifier for Qwen tokenizer')
     
     args = parser.parse_args()
     
@@ -180,20 +179,9 @@ def test_coreml_kv_cache_sequential():
         # Extract metadata
         metadata = extract_metadata(model)
         
-        # Load tokenizer - find Qwen tokenizer
-        if args.tokenizer.startswith('~'):
-            tokenizer_pattern = os.path.expanduser(args.tokenizer + "*")
-            tokenizer_dirs = glob.glob(tokenizer_pattern)
-            if tokenizer_dirs:
-                tokenizer_path = tokenizer_dirs[0]
-            else:
-                print(f"❌ Qwen tokenizer not found at {args.tokenizer}")
-                return False
-        else:
-            tokenizer_path = args.tokenizer
-            
-        print(f"\n🔧 Loading Qwen tokenizer from: {tokenizer_path}")
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=False, trust_remote_code=True)
+        # Load tokenizer using Hugging Face model identifier
+        print(f"\n🔧 Loading Qwen tokenizer: {args.tokenizer}")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=False, trust_remote_code=True)
         print(f"✅ Loaded tokenizer: {tokenizer.__class__.__name__}")
         
         # Create unified state

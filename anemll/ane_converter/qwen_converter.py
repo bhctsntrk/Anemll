@@ -45,6 +45,28 @@ class QwenConverter(BaseConverter):
         self.head_dim = model.model.config.hidden_size // model.model.config.num_attention_heads
         self.converted_model = None
 
+    @staticmethod
+    def GetTransformerStates(model, part=None, prefix="model.model."):
+        """Get the transformer states for CoreML conversion"""
+        head_dim = getattr(model.config, "head_dim", model.config.hidden_size // model.config.num_attention_heads)
+        num_layers = model.config.num_hidden_layers  # Get total number of layers from config
+
+        # For unified cache
+        num_layers_this_part = num_layers * 2  
+        print(f"GetTransformerStates part={part} num_layers_this_part={num_layers_this_part} model.config.num_hidden_layers={model.config.num_hidden_layers}")
+        print(f"Using head_dim={head_dim} from config")
+
+        states = [
+            ct.StateType(
+                wrapped_type=ct.TensorType(
+                    shape=(num_layers_this_part, model.config.num_key_value_heads, model.config.state_length, head_dim),
+                    dtype=np.float16
+                ),
+                name=f"{prefix}kv_cache_0"  # Only one group for unified cache
+            )
+        ]
+        return states
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -93,13 +115,13 @@ class QwenConverter(BaseConverter):
         print("Wrapper model created and set to eval mode")
 
         print("Preparing model inputs for tracing...")
-        # Use fixed window approach - full context length with padding
-        sample_input_ids = torch.zeros((1, self.context_length), dtype=torch.int32, device=TEST_DEVICE)  # [1, context_length] - full window
-        sample_position_ids = torch.arange(self.context_length, dtype=torch.int32, device=TEST_DEVICE)  # [context_length] - [0, 1, 2, ..., 255]
-        sample_causal_mask = torch.zeros((1, 1, self.context_length, self.context_length), dtype=torch.float16, device=TEST_DEVICE)  # [1, 1, context_length, context_length]
-        sample_current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)  # [1] - position to extract logits from
+        # Use single token approach for KV cache compatibility
+        sample_input_ids = torch.zeros((1, 1), dtype=torch.int32, device=TEST_DEVICE)  # [1, 1] - single token
+        sample_position_ids = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)  # [1] - single position
+        sample_causal_mask = torch.zeros((1, 1, 1, self.context_length), dtype=torch.float16, device=TEST_DEVICE)  # [1, 1, 1, context_length]
+        sample_current_pos = torch.zeros((1,), dtype=torch.int32, device=TEST_DEVICE)  # [1] - current position
         sample_update_mask = torch.zeros((1, 1, self.context_length, 1), dtype=torch.float16, device=TEST_DEVICE)  # [1, 1, context_length, 1]
-        print("Sample inputs created (Fixed Window)")
+        print("Sample inputs created (Single Token)")
         print(f"sample_input_ids shape: {sample_input_ids.shape}")
         print(f"sample_position_ids shape: {sample_position_ids.shape}")
         print(f"sample_causal_mask shape: {sample_causal_mask.shape}")
@@ -157,6 +179,7 @@ class QwenConverter(BaseConverter):
                 ct.TensorType(name="logits15", dtype=np.float16),
                 ct.TensorType(name="logits16", dtype=np.float16),
             ],
+            states=self.GetTransformerStates(model, part=None, prefix="model.model."),
             compute_precision=ct.precision.FLOAT16,
             compute_units=ct.ComputeUnit.CPU_AND_NE,
             minimum_deployment_target=ct.target.iOS18,
@@ -248,6 +271,11 @@ def test_conversion(
         print("Loading config...")
         config = QwenConfig.from_json(config_path)
         print(f"Config loaded: hidden_size={config.hidden_size}, vocab_size={config.vocab_size}")
+        
+        # Update config to match conversion parameters
+        config.context_length = context_length
+        config.state_length = max(config.state_length, context_length)  # Ensure state_length is at least context_length
+        print(f"Updated config: context_length={config.context_length}, state_length={config.state_length}")
         
         print("Creating model...")
         model = QwenForCausalLM(config, enable_coreml=True)

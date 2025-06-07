@@ -4,7 +4,6 @@
 import torch
 import sys
 import os
-import glob
 import json
 
 # Add the anemll directory to Python path
@@ -76,25 +75,22 @@ def test_kv_cache_state_management():
     print("🧠 Testing KV Cache State Management")
     print("=" * 60)
     
-    # Find model path
-    model_path = "~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/"
-    model_dirs = glob.glob(os.path.expanduser(model_path + "*") )
-    if not model_dirs:
-        from huggingface_hub import snapshot_download
-        print("Model not found in cache, downloading from HuggingFace...")
-        model_dir = snapshot_download("Qwen/Qwen3-0.6B")
-    else:
-        model_dir = model_dirs[0]
-    print(f"Using model from: {model_dir}")
+    # Use Hugging Face model identifier
+    model_id = "Qwen/Qwen3-0.6B"
+    print(f"Using Hugging Face model: {model_id}")
     
     # Load tokenizer and config
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=False)
-    config = QwenConfig.from_json(os.path.join(model_dir, 'config.json'))
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False, trust_remote_code=True)
+    
+    # Get cached directory using huggingface_hub
+    from huggingface_hub import snapshot_download
+    cached_dir = snapshot_download(model_id, allow_patterns=["config.json", "*.safetensors"])
+    config = QwenConfig.from_json(os.path.join(cached_dir, 'config.json'))
     
     # Load model with KV cache enabled
     print(f"\n📚 Loading Qwen Model with KV Cache...")
     model = QwenForCausalLM(config, enable_coreml=False, disable_kv_cache=False)
-    model.load_pretrained_weights(model_dir)
+    model.load_pretrained_weights(str(cached_dir))
     model.eval()
     
     # Initialize causal mask
@@ -103,7 +99,7 @@ def test_kv_cache_state_management():
     print(f"✅ Created causal mask for context length: {context_length}")
     
     # Test prompt
-    prompt = "The capital of France is"
+    prompt = "What is Apple Neural Engine?"
     print(f"\n🔥 Test prompt: '{prompt}'")
     
     # Tokenize
@@ -184,22 +180,25 @@ def compare_with_batch_prefill():
     print(f"\n🔬 Comparing Single Token vs Batch Prefill")
     print("=" * 50)
     
-    # Load models
-    model_dirs = glob.glob(os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/*"))
-    model_dir = model_dirs[0]
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=False)
-    config = QwenConfig.from_json(os.path.join(model_dir, 'config.json'))
+    # Load models using HF identifier
+    model_id = "Qwen/Qwen3-0.6B"
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False, trust_remote_code=True)
+    
+    # Get cached directory
+    from huggingface_hub import snapshot_download
+    cached_dir = snapshot_download(model_id, allow_patterns=["config.json", "*.safetensors"])
+    config = QwenConfig.from_json(os.path.join(cached_dir, 'config.json'))
     
     model1 = QwenForCausalLM(config, enable_coreml=False, disable_kv_cache=False)
-    model1.load_pretrained_weights(model_dir)
+    model1.load_pretrained_weights(str(cached_dir))
     model1.eval()
     
     model2 = QwenForCausalLM(config, enable_coreml=False, disable_kv_cache=False)
-    model2.load_pretrained_weights(model_dir)
+    model2.load_pretrained_weights(str(cached_dir))
     model2.eval()
     
     # Test prompt
-    prompt = "Hello world"
+    prompt = "What is Apple Neural Engine?"
     input_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=True).input_ids[0].tolist()
     
     causal_mask = create_causal_mask(config.state_length)
