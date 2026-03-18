@@ -368,7 +368,8 @@ struct AnemllCLIAdv: AsyncParsableCommand {
             prefillDynamicSlice: config.prefillDynamicSlice,  // Alternative batch prefill support
             modelPrefix: config.modelPrefix,
             vocabSize: config.vocabSize,
-            lmHeadChunkSizes: config.lmHeadChunkSizes
+            lmHeadChunkSizes: config.lmHeadChunkSizes,
+            perChunkState: config.perChunkState  // Qwen3.5 per-layer MLState
         )
         
         // Resolve sampling parameters (CLI defaults can be overridden by meta recommendation)

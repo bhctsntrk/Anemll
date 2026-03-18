@@ -19,6 +19,8 @@ private typealias Float16 = Float
     private var lmheadModel: MLModel!
     private var ffnChunks: [FFNChunk]!  // Use the FFNChunk defined in FFNChunk.swift
     private var state: MLState!
+    private var chunkStates: [MLState]?  // Per-chunk MLState for Qwen3.5 (each chunk has unique state buffers)
+    private let perChunkState: Bool
     private let contextLength: Int
     private let batchSize: Int
     private var fullCausalMask: MLMultiArray?  // Optional - not needed for monolithic argmax models
@@ -35,6 +37,8 @@ private typealias Float16 = Float
     private let argmaxInModel: Bool  // If true, model outputs argmax_idx/val pairs instead of logits
     private let slidingWindow: Int?  // Gemma3 sliding window - if set, use rotation functions when position >= slidingWindow
     private var hasUpdateMask: Bool = false  // If true, prefill model expects update_mask input for KV cache writes
+    private var inferNeedsUpdateMask: Bool = false  // If true, infer model expects update_mask input (Qwen3.5)
+    private var preAllocatedInferUpdateMask: MLMultiArray?  // Pre-allocated [1, 1, contextLength, 1]
     private var prefillDynamicSlice: Bool = false  // If true, model supports dynamic slice prefill (alternative batch prefill)
 
     // Pre-allocated update_mask for batch prefill (infer doesn't use update_mask)
@@ -343,6 +347,26 @@ private typealias Float16 = Float
         predictionQueue.sync { [self] in
             do {
                 _ = try model.prediction(from: input, using: state, options: options)
+            } catch {
+                predictionError = error
+            }
+        }
+        if let error = predictionError {
+            throw error
+        }
+    }
+
+    /// Per-chunk state variant: uses a specific MLState instead of shared self.state
+    private func runStatefulPredictionOnQueue(
+        model: MLModel,
+        input: MLFeatureProvider,
+        options: MLPredictionOptions,
+        using explicitState: MLState
+    ) throws {
+        var predictionError: Error?
+        predictionQueue.sync {
+            do {
+                _ = try model.prediction(from: input, using: explicitState, options: options)
             } catch {
                 predictionError = error
             }
@@ -785,11 +809,12 @@ private typealias Float16 = Float
     }
 
 
-    public init(models: LoadedModels, contextLength: Int, batchSize: Int, splitLMHead: Int = 8, debugLevel: Int = 0, v110: Bool = false, argmaxInModel: Bool = false, slidingWindow: Int? = nil, updateMaskPrefill: Bool = false, prefillDynamicSlice: Bool = false, disableIOBackings: Bool = false, modelPrefix: String = "llama", vocabSize: Int? = nil, lmHeadChunkSizes: [Int]? = nil) throws {  // Make init throwing
+    public init(models: LoadedModels, contextLength: Int, batchSize: Int, splitLMHead: Int = 8, debugLevel: Int = 0, v110: Bool = false, argmaxInModel: Bool = false, slidingWindow: Int? = nil, updateMaskPrefill: Bool = false, prefillDynamicSlice: Bool = false, disableIOBackings: Bool = false, modelPrefix: String = "llama", vocabSize: Int? = nil, lmHeadChunkSizes: [Int]? = nil, perChunkState: Bool = false) throws {  // Make init throwing
 #if arch(x86_64)
         throw InferenceError.inferenceError("x86_64 has no Apple Neural Engine and is unsupported by this application.")
 #endif
         self.debugLevel = debugLevel
+        self.perChunkState = perChunkState
         self.isMonolithic = models.isMonolithic
         self.argmaxInModel = argmaxInModel
         self.slidingWindow = slidingWindow
@@ -820,12 +845,31 @@ private typealias Float16 = Float
         // Set prefill dynamic slice flag
         self.prefillDynamicSlice = prefillDynamicSlice
 
+        // Detect if infer model expects update_mask (Qwen3.5)
+        if let firstChunk = ffnChunks.first {
+            if firstChunk.inferModel.modelDescription.inputDescriptionsByName["update_mask"] != nil {
+                self.inferNeedsUpdateMask = true
+                // Pre-allocate update_mask for infer: [1, 1, contextLength, 1]
+                self.preAllocatedInferUpdateMask = try MLMultiArray(
+                    shape: [1, 1, NSNumber(value: contextLength), 1],
+                    dataType: .float16
+                )
+                print("Infer model expects update_mask — pre-allocated [1, 1, \(contextLength), 1]")
+            }
+        }
+
+        // Per-chunk state models are infer-only — auto-disable batch prefill
+        if perChunkState {
+            self.disablePrefill = true
+            print("Per-chunk state enabled — auto-disabling batch prefill (infer-only mode)")
+        }
+
         // Match Python tests/chat.py behavior:
         // allow partial-batch prefill if either update_mask_prefill or
         // prefill_dynamic_slice is available.
         let allowBatchPrefill = hasUpdateMask || prefillDynamicSlice
 
-        print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize), isMonolithic=\(isMonolithic), argmaxInModel=\(argmaxInModel), slidingWindow=\(slidingWindow != nil ? "\(slidingWindow!)" : "nil"), hasRotation=\(hasRotation), hasUpdateMask=\(hasUpdateMask), prefillDynamicSlice=\(prefillDynamicSlice), allowBatchPrefill=\(allowBatchPrefill), disableIOBackings=\(disableIOBackings)")
+        print("InferenceManager initialized with v110=\(v110), splitLMHead=\(splitLMHead), batchSize=\(batchSize), isMonolithic=\(isMonolithic), argmaxInModel=\(argmaxInModel), slidingWindow=\(slidingWindow != nil ? "\(slidingWindow!)" : "nil"), hasRotation=\(hasRotation), hasUpdateMask=\(hasUpdateMask), prefillDynamicSlice=\(prefillDynamicSlice), allowBatchPrefill=\(allowBatchPrefill), perChunkState=\(perChunkState), inferNeedsUpdateMask=\(inferNeedsUpdateMask), disableIOBackings=\(disableIOBackings)")
 
         // Print prefill mode info (matching Python chat_full.py)
         if allowBatchPrefill {
@@ -1050,9 +1094,15 @@ private typealias Float16 = Float
     }
     
     public func initState()  {
-        // For monolithic models, create state from inferModel (like Python does)
-        // This ensures state compatibility when switching between prefill and infer functions
-        if isMonolithic {
+        if perChunkState {
+            // Per-chunk MLState (Qwen3.5): each chunk has unique state buffers
+            self.chunkStates = ffnChunks.map { $0.inferModel.makeState() }
+            if debugLevel >= 1 {
+                print("Initialized \(ffnChunks.count) per-chunk MLStates")
+            }
+        } else if isMonolithic {
+            // For monolithic models, create state from inferModel (like Python does)
+            // This ensures state compatibility when switching between prefill and infer functions
             self.state = ffnChunks[0].inferModel.makeState()
         } else {
             self.state = ffnChunks[0].prefillModel.makeState()
@@ -1063,7 +1113,9 @@ private typealias Float16 = Float
         guard let chunks = ffnChunks, !chunks.isEmpty else {
             return
         }
-        if isMonolithic {
+        if perChunkState {
+            chunkStates = chunks.map { $0.inferModel.makeState() }
+        } else if isMonolithic {
             state = chunks[0].inferModel.makeState()
         } else {
             state = chunks[0].prefillModel.makeState()
@@ -1772,15 +1824,17 @@ private typealias Float16 = Float
                 ])
 
                 // Use rotation function if available and batchPos >= slidingWindow
-                if useRotation, let prefillRotateModel = chunk.prefillRotateModel {
+                let prefillModelToUse = (useRotation && chunk.prefillRotateModel != nil) ? chunk.prefillRotateModel! : chunk.prefillModel
+                if perChunkState, let states = chunkStates {
                     try runStatefulPredictionOnQueue(
-                        model: prefillRotateModel,
+                        model: prefillModelToUse,
                         input: prefillInput,
-                        options: ffnOptions
+                        options: ffnOptions,
+                        using: states[index]
                     )
                 } else {
                     try runStatefulPredictionOnQueue(
-                        model: chunk.prefillModel,
+                        model: prefillModelToUse,
                         input: prefillInput,
                         options: ffnOptions
                     )
@@ -2320,23 +2374,35 @@ private typealias Float16 = Float
                 ffnOptions.outputBackings = backings
             }
 
-            let inferInput = try MLDictionaryFeatureProvider(dictionary: [
+            var inferDict: [String: Any] = [
                 "hidden_states": currentHiddenStates,
                 "position_ids": positionIds,
                 "causal_mask": causalMask,
                 "current_pos": currentPosArray
-            ])
+            ]
+            // Add update_mask if infer model expects it (Qwen3.5)
+            if inferNeedsUpdateMask, let updateMask = preAllocatedInferUpdateMask {
+                // Clear previous position, set current position
+                if safePos > 0 {
+                    updateMask[[0, 0, NSNumber(value: safePos - 1), 0] as [NSNumber]] = NSNumber(value: Float(0.0))
+                }
+                updateMask[[0, 0, NSNumber(value: safePos), 0] as [NSNumber]] = NSNumber(value: Float(1.0))
+                inferDict["update_mask"] = updateMask
+            }
+            let inferInput = try MLDictionaryFeatureProvider(dictionary: inferDict)
 
             // Use rotation function if available and position >= slidingWindow
-            if useRotation, let inferRotateModel = chunk.inferRotateModel {
+            let modelToUse = (useRotation && chunk.inferRotateModel != nil) ? chunk.inferRotateModel! : chunk.inferModel
+            if perChunkState, let states = chunkStates {
                 try runStatefulPredictionOnQueue(
-                    model: inferRotateModel,
+                    model: modelToUse,
                     input: inferInput,
-                    options: ffnOptions
+                    options: ffnOptions,
+                    using: states[chunkIndex]
                 )
             } else {
                 try runStatefulPredictionOnQueue(
-                    model: chunk.inferModel,
+                    model: modelToUse,
                     input: inferInput,
                     options: ffnOptions
                 )
@@ -3220,9 +3286,9 @@ private typealias Float16 = Float
         // This ensures each generateResponse call starts fresh, which is required
         // when the full conversation is re-tokenized for each turn
         if let chunks = ffnChunks, !chunks.isEmpty {
-            // For monolithic models, create state from inferModel (matching initState behavior)
-            // This ensures state compatibility when switching between prefill and infer functions
-            if isMonolithic {
+            if perChunkState {
+                chunkStates = chunks.map { $0.inferModel.makeState() }
+            } else if isMonolithic {
                 state = chunks[0].inferModel.makeState()
             } else {
                 state = chunks[0].prefillModel.makeState()
@@ -3309,7 +3375,11 @@ private typealias Float16 = Float
                     onWindowShift?()
                     
                     // Reset state and run prefill on shifted content
-                    state = ffnChunks[0].prefillModel.makeState()
+                    if perChunkState {
+                        chunkStates = ffnChunks.map { $0.inferModel.makeState() }
+                    } else {
+                        state = ffnChunks[0].prefillModel.makeState()
+                    }
                     currentPos = try await runPrefill(on: &contextTokens, contextPos: newSize, tokenizer: tokenizer)
                     
                     if debugLevel >= 2 {

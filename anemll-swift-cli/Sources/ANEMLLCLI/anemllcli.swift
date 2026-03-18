@@ -370,7 +370,8 @@ struct AnemllCLI: AsyncParsableCommand {
             prefillDynamicSlice: config.prefillDynamicSlice,  // Alternative batch prefill support
             modelPrefix: config.modelPrefix,
             vocabSize: config.vocabSize,
-            lmHeadChunkSizes: config.lmHeadChunkSizes
+            lmHeadChunkSizes: config.lmHeadChunkSizes,
+            perChunkState: config.perChunkState  // Qwen3.5 per-layer MLState
         )
         
         if let prompt = prompt {

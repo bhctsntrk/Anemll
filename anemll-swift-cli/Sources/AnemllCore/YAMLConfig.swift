@@ -41,6 +41,12 @@ public struct YAMLConfig: Sendable {
     // Dynamic slice prefill support (alternative to update_mask for batch prefill)
     public let prefillDynamicSlice: Bool  // If true, model supports dynamic slice prefill
 
+    // Per-chunk MLState support (Qwen3.5: each chunk has unique state buffers)
+    public let perChunkState: Bool  // If true, create separate MLState per FFN chunk
+
+    // Infer-only support (no prefill model — DeltaNet sequential architecture)
+    public let inferOnly: Bool  // If true, skip loading prefill function, use infer for all tokens
+
     // Model prefix for template auto-detection
     public let modelPrefix: String
 
@@ -94,6 +100,12 @@ public struct YAMLConfig: Sendable {
 
         // Dynamic slice prefill support
         self.prefillDynamicSlice = yaml["prefill_dynamic_slice"] as? Bool ?? false
+
+        // Per-chunk state support (Qwen3.5)
+        self.perChunkState = yaml["per_chunk_state"] as? Bool ?? false
+
+        // Infer-only support (no prefill model)
+        self.inferOnly = yaml["infer_only"] as? Bool ?? false
 
         // Model prefix for template auto-detection
         self.modelPrefix = yaml["model_prefix"] as? String ?? "llama"
@@ -298,6 +310,18 @@ public struct YAMLConfig: Sendable {
                 print("Prefill dynamic slice enabled")
             }
 
+            // Check for per_chunk_state flag (Qwen3.5: per-layer MLState buffers)
+            let perChunkState = params["per_chunk_state"] as? Bool ?? false
+            if perChunkState {
+                print("Per-chunk MLState enabled (each chunk has unique state buffers)")
+            }
+
+            // Check for infer_only flag (no prefill model)
+            let inferOnly = params["infer_only"] as? Bool ?? false
+            if inferOnly {
+                print("Infer-only mode enabled (no prefill model)")
+            }
+
             if let rec = recommendedSampling,
                let recTemp = YAMLConfig.toDouble(rec["temperature"]),
                let recTopP = YAMLConfig.toDouble(rec["top_p"] ?? rec["topP"]),
@@ -358,7 +382,9 @@ public struct YAMLConfig: Sendable {
                 "is_monolithic": isMonolithic,
                 "argmax_in_model": argmaxInModel,
                 "update_mask_prefill": updateMaskPrefill,
-                "prefill_dynamic_slice": prefillDynamicSlice
+                "prefill_dynamic_slice": prefillDynamicSlice,
+                "per_chunk_state": perChunkState,
+                "infer_only": inferOnly
             ]
             if let rec = recommendedSampling {
                 configDict["recommended_sampling"] = rec
@@ -422,7 +448,9 @@ public struct YAMLConfig: Sendable {
             "vocab_size": params["vocab_size"] as? Int as Any,
             "lm_head_chunk_sizes": params["lm_head_chunk_sizes"] as? [Int] as Any,
             "is_monolithic": isMonolithic,
-            "argmax_in_model": argmaxInModel
+            "argmax_in_model": argmaxInModel,
+            "per_chunk_state": params["per_chunk_state"] as? Bool ?? false,
+            "infer_only": params["infer_only"] as? Bool ?? false
         ]
         if let rec = recommendedSampling {
             configDict["recommended_sampling"] = rec

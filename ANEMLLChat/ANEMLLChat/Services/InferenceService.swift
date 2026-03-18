@@ -233,7 +233,8 @@ final class InferenceService: ObservableObject {
                 prefillDynamicSlice: config.prefillDynamicSlice,
                 modelPrefix: config.modelPrefix,
                 vocabSize: config.vocabSize,
-                lmHeadChunkSizes: config.lmHeadChunkSizes
+                lmHeadChunkSizes: config.lmHeadChunkSizes,
+                perChunkState: config.perChunkState
             )
             print("===== [MODEL CONFIG] splitLMHead=\(config.splitLMHead), context=\(config.contextLength), batch=\(config.batchSize), argmax=\(config.argmaxInModel) =====")
 

@@ -338,15 +338,41 @@ public actor ModelLoader {
                 var inferRotateModel: MLModel? = nil
                 var prefillRotateModel: MLModel? = nil
 
-                // Multi-function model: load infer and prefill functions separately.
-                print("Loading inference chunk \(i): \(chunkPath)")
-                modelConfig.functionName = "infer"
+                // Models compiled with coremltools ct.utils.compile_model() (no Xcode)
+                // produce non-ML-Program format where functionName must be nil.
+                // ML Program models (from xcrun coremlcompiler) support named functions
+                // like "infer" and "prefill". We try multi-function first and fall back
+                // to single-function if loading fails — this handles both formats gracefully.
+                var chunkIsSingleFunction = configCopy.inferOnly
+                if chunkIsSingleFunction {
+                    // Infer-only model (Qwen3.5 DeltaNet): single function, no function name needed
+                    print("Loading inference chunk \(i): \(chunkPath) (infer-only)")
+                    modelConfig.functionName = nil
+                } else {
+                    // Multi-function model: load infer and prefill functions separately.
+                    print("Loading inference chunk \(i): \(chunkPath)")
+                    modelConfig.functionName = "infer"
+                }
                 do {
                     inferModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
                     print("✅ Inference chunk \(i) loaded")
                 } catch {
-                    print("❌ Error loading inference chunk \(i): \(error)")
-                    throw ModelError.inferenceError("Failed to load inference chunk \(i): \(String(reflecting: error))")
+                    // If functionName="infer" fails, model is not ML Program — retry with nil
+                    if !chunkIsSingleFunction {
+                        print("⚠️ Multi-function load failed for chunk \(i), retrying as single-function...")
+                        modelConfig.functionName = nil
+                        do {
+                            inferModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
+                            chunkIsSingleFunction = true
+                            print("✅ Inference chunk \(i) loaded as single-function")
+                        } catch {
+                            print("❌ Error loading inference chunk \(i): \(error)")
+                            throw ModelError.inferenceError("Failed to load inference chunk \(i): \(String(reflecting: error))")
+                        }
+                    } else {
+                        print("❌ Error loading inference chunk \(i): \(error)")
+                        throw ModelError.inferenceError("Failed to load inference chunk \(i): \(String(reflecting: error))")
+                    }
                 }
 
                 try await progressTracker.updateProgress(
@@ -361,14 +387,20 @@ public actor ModelLoader {
                     detail: "Prefill \(i)/\(configCopy.numChunks)"
                 )
 
-                print("Loading prefill chunk \(i): \(chunkPath)")
-                modelConfig.functionName = "prefill"
-                do {
-                    prefillModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
-                    print("✅ Prefill chunk \(i) loaded")
-                } catch {
-                    print("❌ Error loading prefill chunk \(i): \(error)")
-                    throw ModelError.inferenceError("Failed to load prefill chunk \(i): \(String(reflecting: error))")
+                if chunkIsSingleFunction {
+                    // Single-function model: reuse infer model for prefill
+                    prefillModel = inferModel
+                    print("✅ Prefill chunk \(i): using infer model (single-function)")
+                } else {
+                    print("Loading prefill chunk \(i): \(chunkPath)")
+                    modelConfig.functionName = "prefill"
+                    do {
+                        prefillModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
+                        print("✅ Prefill chunk \(i) loaded")
+                    } catch {
+                        print("❌ Error loading prefill chunk \(i): \(error)")
+                        throw ModelError.inferenceError("Failed to load prefill chunk \(i): \(String(reflecting: error))")
+                    }
                 }
 
                 try await progressTracker.updateProgress(
@@ -378,7 +410,8 @@ public actor ModelLoader {
                 )
 
                 // Try to load rotation functions (4-function model for Gemma3 with sliding window)
-                if configCopy.slidingWindow != nil {
+                // Skip for single-function models (not ML Program, no named functions)
+                if !chunkIsSingleFunction, configCopy.slidingWindow != nil {
                     print("Sliding window configured, attempting to load rotation functions...")
                     modelConfig.functionName = "infer_rotate"
                     do {
@@ -503,15 +536,38 @@ public actor ModelLoader {
         var inferRotateModel: MLModel? = nil
         var prefillRotateModel: MLModel? = nil
 
-        // Multi-function model: load infer and prefill functions separately.
+        // Try multi-function ML Program first, fall back to single-function if not ML Program.
+        // Models from ct.utils.compile_model() (no Xcode) require functionName=nil.
+        // Models from xcrun coremlcompiler support named functions "infer"/"prefill".
+        // The graceful fallback avoids the "functionName must be nil unless model type
+        // is ML Program" error that crashes on non-ML-Program .mlmodelc files.
+        var isSingleFunction = config.inferOnly
         print("Loading monolithic infer function...")
-        modelConfig.functionName = "infer"
+        if isSingleFunction {
+            modelConfig.functionName = nil
+        } else {
+            modelConfig.functionName = "infer"
+        }
         do {
             inferModel = try ModelLoader.loadMLModel(at: monolithicURL, configuration: modelConfig)
             print("✅ Monolithic infer function loaded")
         } catch {
-            print("❌ Error loading monolithic infer function: \(error)")
-            throw ModelError.inferenceError("Failed to load monolithic infer function: \(String(reflecting: error))")
+            // If functionName="infer" fails, model is not ML Program — retry with nil
+            if !isSingleFunction {
+                print("⚠️ Multi-function load failed, retrying as single-function model...")
+                modelConfig.functionName = nil
+                do {
+                    inferModel = try ModelLoader.loadMLModel(at: monolithicURL, configuration: modelConfig)
+                    isSingleFunction = true
+                    print("✅ Monolithic model loaded as single-function")
+                } catch {
+                    print("❌ Error loading monolithic model: \(error)")
+                    throw ModelError.inferenceError("Failed to load monolithic model: \(String(reflecting: error))")
+                }
+            } else {
+                print("❌ Error loading monolithic infer function: \(error)")
+                throw ModelError.inferenceError("Failed to load monolithic infer function: \(String(reflecting: error))")
+            }
         }
 
         try await progressTracker.updateProgress(
@@ -526,14 +582,20 @@ public actor ModelLoader {
             detail: "Prefill function"
         )
 
-        print("Loading monolithic prefill function...")
-        modelConfig.functionName = "prefill"
-        do {
-            prefillModel = try ModelLoader.loadMLModel(at: monolithicURL, configuration: modelConfig)
-            print("✅ Monolithic prefill function loaded")
-        } catch {
-            print("❌ Error loading monolithic prefill function: \(error)")
-            throw ModelError.inferenceError("Failed to load monolithic prefill function: \(String(reflecting: error))")
+        if isSingleFunction {
+            // Single-function model: reuse infer model for prefill
+            prefillModel = inferModel
+            print("✅ Monolithic prefill: using infer model (single-function)")
+        } else {
+            print("Loading monolithic prefill function...")
+            modelConfig.functionName = "prefill"
+            do {
+                prefillModel = try ModelLoader.loadMLModel(at: monolithicURL, configuration: modelConfig)
+                print("✅ Monolithic prefill function loaded")
+            } catch {
+                print("❌ Error loading monolithic prefill function: \(error)")
+                throw ModelError.inferenceError("Failed to load monolithic prefill function: \(String(reflecting: error))")
+            }
         }
 
         try await progressTracker.updateProgress(
@@ -542,8 +604,8 @@ public actor ModelLoader {
             detail: nil
         )
 
-        // Optional rotation functions for sliding-window models.
-        if let slidingWindow = config.slidingWindow, config.contextLength > slidingWindow {
+        // Optional rotation functions for sliding-window models (multi-function only).
+        if !isSingleFunction, let slidingWindow = config.slidingWindow, config.contextLength > slidingWindow {
             print("Loading optional monolithic rotate functions...")
 
             modelConfig.functionName = "infer_rotate"
