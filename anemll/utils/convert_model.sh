@@ -308,6 +308,7 @@ CONFIG_FILE="$MODEL_PATH/config.json"
 ARCH="llama"
 SLIDING_WINDOW=""
 HAS_SWA=false
+IS_QWEN35=false
 if [ -f "$CONFIG_FILE" ]; then
     ARCH=$(jq -r '.model_type // (.architectures[0] // "")' "$CONFIG_FILE" | tr '[:upper:]' '[:lower:]')
     # Check for Qwen2 (which is Qwen 2.5) or Qwen2ForCausalLM architecture
@@ -316,6 +317,12 @@ if [ -f "$CONFIG_FILE" ]; then
         # Use "qwen25" as default prefix for Qwen 2.5 models unless explicitly set
         if [ "$PREFIX" = "llama" ]; then
             PREFIX="qwen25"
+        fi
+    elif [[ "$ARCH" == "qwen3_5"* ]]; then
+        CONVERTER="python3 -m anemll.ane_converter.qwen3_5_converter"
+        IS_QWEN35=true
+        if [ "$PREFIX" = "llama" ]; then
+            PREFIX="qwen35"
         fi
     elif [[ "$ARCH" == qwen* ]]; then
         CONVERTER="python3 -m anemll.ane_converter.qwen_converter"
@@ -619,7 +626,9 @@ else
     echo "Skipping step 3: Converting FFN"
 fi
 
-if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "4" ]; then
+if [ "$IS_QWEN35" = true ]; then
+    echo "Skipping step 4: Qwen3.5 uses infer-only (no prefill — DeltaNet sequential)"
+elif [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "4" ]; then
     run_step 4 "Converting Prefill" "$CONVERTER \
         --part 2_prefill \
         $LUT2_PARAM \
@@ -697,7 +706,22 @@ if [ "$SKIP_ANEMLL_DEDUP" = true ]; then
     SKIP_DEDUP_FLAG="--skip-anemll-dedup"
 fi
 
-if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "5" ]; then
+if [ "$IS_QWEN35" = true ]; then
+    # Qwen3.5: no prefill to combine — rename FFN → FFN_PF for pipeline compatibility
+    echo "Step 5: Renaming FFN → FFN_PF for Qwen3.5 (infer-only, no combine needed)"
+    LUT_SUFFIX=""
+    if [ ! -z "$LUT_PART2" ]; then
+        LUT_SUFFIX="_lut${LUT_PART2%%,*}"
+    fi
+    for i in $(seq 1 $NUM_CHUNKS); do
+        SRC="${OUTPUT_DIR}/${PREFIX}_FFN${LUT_SUFFIX}_chunk_$(printf '%02d' $i)of$(printf '%02d' $NUM_CHUNKS).mlpackage"
+        DST="${OUTPUT_DIR}/${PREFIX}_FFN_PF${LUT_SUFFIX}_chunk_$(printf '%02d' $i)of$(printf '%02d' $NUM_CHUNKS).mlpackage"
+        if [ -d "$SRC" ]; then
+            mv "$SRC" "$DST"
+            echo "  Renamed: $(basename $SRC) → $(basename $DST)"
+        fi
+    done
+elif [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "5" ]; then
     if [ ! -z "$LUT_PART2" ]; then
         run_step 5 "Combining Models" "python3 \"$PROJECT_ROOT/anemll/utils/combine_models.py\" \
             --chunk $NUM_CHUNKS \
@@ -831,6 +855,14 @@ if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
   \"model_type\": \"qwen2\"
 }
 EOF_CONFIG
+            elif [[ \"$ARCH\" == \"qwen3_5\"* ]]; then
+                # Create Qwen 3.5-specific config.json
+                cat > \"$OUTPUT_DIR/config.json\" <<'EOF_CONFIG'
+{
+  \"tokenizer_class\": \"Qwen2Tokenizer\",
+  \"model_type\": \"qwen3_5\"
+}
+EOF_CONFIG
             elif [[ \"$ARCH\" == qwen* ]]; then
                 # Create Qwen-specific config.json
                 cat > \"$OUTPUT_DIR/config.json\" <<'EOF_CONFIG'
@@ -872,11 +904,17 @@ EOF_CONFIG
         if [ \"$SINGLE_CACHE\" = true ]; then
             SINGLE_CACHE_META_FLAG=\"--single-cache\"
         fi
+        PER_CHUNK_STATE_FLAG=\"\"
+        INFER_ONLY_FLAG=\"\"
+        if [ \"$IS_QWEN35\" = true ]; then
+            PER_CHUNK_STATE_FLAG=\"--per-chunk-state\"
+            INFER_ONLY_FLAG=\"--infer-only\"
+        fi
 
         ANEMLL_CONVERSION_INFO=\"\$CONVERSION_INFO\" python3 \"$PROJECT_ROOT/anemll/utils/generate_meta_yaml.py\" \
             \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
             \"${LUT_PART1:-none}\" \"${LUT_PART2:-none}\" \"${LUT_PART3:-none}\" \
-            $NUM_CHUNKS \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\" \$ARGMAX_META_FLAG \$SPLIT_ROTATE_META_FLAG \$SLIDING_WINDOW_FLAG \$UPDATE_MASK_PREFILL_FLAG \$PREFILL_DYNAMIC_SLICE_FLAG \$SINGLE_CACHE_META_FLAG
+            $NUM_CHUNKS \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\" \$ARGMAX_META_FLAG \$SPLIT_ROTATE_META_FLAG \$SLIDING_WINDOW_FLAG \$UPDATE_MASK_PREFILL_FLAG \$PREFILL_DYNAMIC_SLICE_FLAG \$SINGLE_CACHE_META_FLAG \$PER_CHUNK_STATE_FLAG \$INFER_ONLY_FLAG
     "
 fi
 

@@ -13,30 +13,42 @@ import argparse
 import coremltools as ct
 
 def compile_model(model_path: str, target_dir: str = "./", force_mlprogram: bool = False) -> bool:
-    """Compile a single CoreML model using coremlcompiler.
-    
+    """Compile a single CoreML model to .mlmodelc.
+
+    Tries xcrun coremlcompiler first (requires Xcode), falls back to
+    coremltools.utils.compile_model (works without Xcode).
+
     Args:
         model_path: Path to .mlpackage file
         target_dir: Target directory for compiled model
-    
+
     Returns:
         bool: True if compilation succeeded
     """
+    basename = os.path.basename(model_path)
+    print(f"\nCompiling {basename}...")
+
+    # Try xcrun coremlcompiler first
     try:
         cmd = ["xcrun", "coremlcompiler", "compile", model_path, target_dir]
-        # Optionally force ML Program when compiling .mlpackage files.
         if force_mlprogram and model_path.endswith(".mlpackage"):
             cmd += ["--add-mlprogram-if-eligible", "force"]
-        print(f"\nCompiling {os.path.basename(model_path)}...")
         result = subprocess.run(cmd, capture_output=True, text=True)
-        
         if result.returncode == 0:
-            print("Compilation successful")
+            print("Compilation successful (coremlcompiler)")
             return True
         else:
-            print(f"Compilation failed with error:\n{result.stderr}")
-            return False
-            
+            print(f"coremlcompiler failed: {result.stderr.strip()}")
+    except FileNotFoundError:
+        print("coremlcompiler not found (Xcode not installed)")
+
+    # Fallback: coremltools.utils.compile_model
+    try:
+        model_name = basename.replace(".mlpackage", "")
+        dst = os.path.join(target_dir, f"{model_name}.mlmodelc")
+        ct.utils.compile_model(model_path, dst)
+        print(f"Compilation successful (coremltools fallback)")
+        return True
     except Exception as e:
         print(f"Error compiling {model_path}: {str(e)}")
         return False

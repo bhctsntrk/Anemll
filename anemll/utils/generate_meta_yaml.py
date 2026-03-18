@@ -348,6 +348,16 @@ def main():
     if split_rotate:
         sys.argv.remove('--split-rotate')
 
+    # Check for --per-chunk-state flag (Qwen3.5: per-layer MLState buffers)
+    per_chunk_state = '--per-chunk-state' in sys.argv
+    if per_chunk_state:
+        sys.argv.remove('--per-chunk-state')
+
+    # Check for --infer-only flag (no prefill model — DeltaNet sequential)
+    infer_only = '--infer-only' in sys.argv
+    if infer_only:
+        sys.argv.remove('--infer-only')
+
     # Check for --sliding-window flag (e.g., --sliding-window 1024)
     sliding_window = None
     for i, arg in enumerate(sys.argv):
@@ -499,13 +509,15 @@ def main():
     update_mask_line = '\n    update_mask_prefill: true' if update_mask_prefill else ''
     prefill_dynamic_slice_line = '\n    prefill_dynamic_slice: true' if prefill_dynamic_slice else ''
     single_cache_line = '\n    single_cache: true' if single_cache else ''
+    per_chunk_state_line = '\n    per_chunk_state: true' if per_chunk_state else ''
+    infer_only_line = '\n    infer_only: true' if infer_only else ''
 
     meta_parts.append(f'''    num_chunks: {NUM_CHUNKS}
     model_prefix: {PREFIX}
     embeddings: {embeddings_path}
     lm_head: {lmhead_path}
     ffn: {ffn_path}{pf_line}
-    split_lm_head: {split_lm_head}{argmax_line}{vocab_line}{chunk_sizes_line}{split_rotate_line}{sliding_window_line}{update_mask_line}{prefill_dynamic_slice_line}{single_cache_line}
+    split_lm_head: {split_lm_head}{argmax_line}{vocab_line}{chunk_sizes_line}{split_rotate_line}{sliding_window_line}{update_mask_line}{prefill_dynamic_slice_line}{single_cache_line}{per_chunk_state_line}{infer_only_line}
 ''')
 
     meta = '\n'.join(meta_parts)

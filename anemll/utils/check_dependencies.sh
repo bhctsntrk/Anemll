@@ -141,14 +141,14 @@ if [ "$SKIP_CHECK" = false ]; then
 
     echo "Checking if coremlcompiler is available..."
     if ! xcrun --find coremlcompiler >/dev/null 2>&1; then
-        echo "coremlcompiler is required but not found. Aborting. (Issue #4)"
-        echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
-        exit 1
+        echo "WARNING: coremlcompiler not found (Xcode not installed)."
+        echo "  compile_models.py will use coremltools fallback (ct.utils.compile_model)."
+        echo "  For best results, install Xcode from the App Store."
+    else
+        echo "Displaying coremlcompiler version..."
+        coremlcompiler_version=$(xcrun coremlcompiler version 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+')
+        echo "coremlcompiler version: $coremlcompiler_version"
     fi
-
-    echo "Displaying coremlcompiler version..."
-    coremlcompiler_version=$(xcrun coremlcompiler version 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+')
-    echo "coremlcompiler version: $coremlcompiler_version"
 
     echo "Checking if Python3 is installed..."
     command -v python3 >/dev/null 2>&1 || { echo >&2 "Python3 is required but it's not installed. Aborting."; echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."; exit 1; }
