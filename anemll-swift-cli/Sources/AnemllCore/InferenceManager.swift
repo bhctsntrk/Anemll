@@ -3321,6 +3321,7 @@ private typealias Float16 = Float
                 if debugLevel >= 1 {
                     print("\n[Debug] Prefill disabled: using infer-only prefill over \(contextTokens.count) tokens")
                 }
+                let prefillStart = CFAbsoluteTimeGetCurrent()
                 var pos = 0
                 while pos < contextTokens.count {
                     let _ = try await generateNextToken(
@@ -3335,7 +3336,7 @@ private typealias Float16 = Float
                     pos += 1
                 }
                 currentPos = contextTokens.count
-                prefillTime = 0
+                prefillTime = CFAbsoluteTimeGetCurrent() - prefillStart
             } else {
                 // Run prefill with mutable copy
                 currentPos = try await runPrefill(on: &contextTokens, contextPos: contextTokens.count, tokenizer: tokenizer)
